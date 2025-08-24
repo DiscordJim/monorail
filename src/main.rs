@@ -1,10 +1,10 @@
-use std::{ffi::CString, io::stdout, net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs}, os::fd::AsRawFd, time::Duration};
+use std::{ffi::CString, io::stdout, net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs}, os::fd::AsRawFd, time::{Duration, SystemTime}};
 
-use io_uring::{cqueue, opcode::{self, Bind, Connect, Socket}, squeue, types, IoUring, Probe};
-use nix::libc::{AF_INET, EBADF, EINVAL, IPPROTO_TCP, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDONLY, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM};
+use io_uring::{cqueue, opcode::{self, Accept, Bind, Connect, Read, Socket}, squeue, types, IoUring, Probe};
+use nix::libc::{self, sockaddr, sockaddr_in, AF_INET, EBADF, EFAULT, EINVAL, IPPROTO_TCP, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDONLY, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM};
 use smol::{future, LocalExecutor, Timer};
 
-use crate::core::{io::ring::{accept, bind, close, connect, listen, openat, read, socket, write, IoRingDriver}, topology::MonorailTopology};
+use crate::core::{io::ring::{accept, bind, close, connect, ipv4_to_libc, listen, openat, read, socket, timeout, write, IoRingDriver}, topology::MonorailTopology};
 
 pub mod core;
 
@@ -309,7 +309,19 @@ fn main() {
         }).detach();
 
 
-        // let socket = socket(ring, domain, socket_type, protocol)
+        // EBADF
+
+        println!("advancing...");
+
+        println!("Supports IORING BIND: {}", driver.supports_bind());
+
+        // EFAULT
+        // EINVAL
+
+        // read(&driver, -1, vec![]).await.0.unwrap();
+
+        // bind(&driver, -1, "0.0.0.0:69".to_socket_addrs().unwrap().next().unwrap()).await.unwrap();
+        // let socket = socket(&driver, A, socket_type, protocol)
 
 
         // let stdout = stdout();
@@ -317,19 +329,38 @@ fn main() {
 
         // write(&driver, fs, "get hecked!\n".as_bytes().to_vec()).await.0.unwrap();
 
+
+        // let time = SystemTime::now();
+
+        // timeout(&driver, Duration::from_secs(5)).await.unwrap();
+        // let elapsed = time.elapsed().unwrap();
+        // println!("Elapsed: {:?}", elapsed);
         let socket = socket(&driver, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP).await.unwrap();
         println!("Socket: {socket}");
-        // EINVAL
+        // // EINVAL
 
-        println!("Support: {}", Probe::new().is_supported(Socket::CODE));
+        // println!("Support: {}", Probe::new().is_supported(Socket::CODE));
 
-        bind(&driver, socket, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6969))).await.unwrap();
+
+        // let ie = ipv4_to_libc(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6942));
+
+
+        // let bruh = unsafe { libc::bind(socket, &ie as *const _ as *const sockaddr, size_of::<sockaddr_in>() as u32 ) };
+        // println!("bruh: {:?}", bruh);
+        bind(&driver, socket, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6942))).await.unwrap();
+        // let listen = unsafe { libc::listen(socket, 1000) };
+        // println!("listen: {listen}");
         listen(&driver, socket, 1000).await.unwrap();
 
         let accept = accept(&driver, socket, SOCK_CLOEXEC | SOCK_NONBLOCK).await.unwrap();
 
         println!("Accepted: {:?}", accept);
+
+        // let mut buffer = vec![0; 128];
+
+        // let (r, o) = read(&driver, accept.0, buffer).await;
         
+        // println!("{o:?}");
 
         // let addy = "0.0.0.0:6969".to_socket_addrs().unwrap().next().unwrap();
         // println!("Addy: {:?}", addy);

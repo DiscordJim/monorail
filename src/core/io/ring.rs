@@ -1,16 +1,30 @@
 use std::{
-    cell::RefCell, ffi::CStr, future::Future, io::{Error, ErrorKind}, mem::zeroed, net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6}, os::fd::RawFd, task::{Poll, Waker}
+    cell::{LazyCell, RefCell},
+    ffi::CStr,
+    future::Future,
+    io::{Error, ErrorKind},
+    mem::zeroed,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    os::fd::RawFd,
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    task::{Poll, Waker},
+    time::Duration,
 };
 
 use io_uring::{
     cqueue,
-    opcode::{Accept, Bind, Close, Connect, Fsync, Listen, OpenAt, Read, Socket, Write},
+    opcode::{
+        Accept, Bind, Close, Connect, Fsync, Listen, OpenAt, Read, Shutdown, Socket, Timeout, Write,
+    },
     squeue,
-    types::{self, Fd},
+    types::{self, Fd, Timespec},
     IoUring,
 };
-use nix::libc::{
-    in6_addr, in_addr, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t, AF_INET, AF_INET6, AT_FDCWD, E2BIG, EAGAIN, EBADF, EFAULT, EINTR, EINVAL, EIO, EISDIR, EWOULDBLOCK
+use nix::{
+    libc::{
+        self, in6_addr, in_addr, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t, timespec, AF_INET, AF_INET6, AT_FDCWD, E2BIG, EAGAIN, EBADF, EFAULT, EINTR, EINVAL, EIO, EISDIR, EWOULDBLOCK
+    },
+    sys::time::TimeSpec,
 };
 use slab::Slab;
 
@@ -24,14 +38,111 @@ struct RingEntry {
 pub struct IoRingDriver {
     ring: RefCell<IoUring<squeue::Entry, cqueue::Entry>>,
     slab: RefCell<Slab<RingEntry>>,
+    support: IoRingSupport,
 }
+
+struct IoRingSupport {
+    has_bind: bool,
+    has_checked_bind: bool,
+    has_listen: bool,
+}
+
+#[inline]
+fn perform_compatibility_checks(ring: &mut IoUring) -> std::io::Result<()> {
+    if IORING_BIND_SUPPORT.load(Ordering::Relaxed) == 0 {
+        
+        let addr = sockaddr_in {
+            sin_addr: in_addr { s_addr: 0 },
+            sin_family: 0,
+            sin_port: 0,
+            sin_zero: [0u8; 8]
+        };
+
+        // submit an invalid 
+        let bind = Bind::new(types::Fd(-1), &addr as *const _ as *const sockaddr, size_of::<sockaddr_in>() as u32)
+            .build();
+       
+        unsafe {
+            ring.submission().push(&bind).map_err(|_| Error::other("Failed to submit to submission queue."))?;
+        }
+
+        ring.submit_and_wait(1)?;
+
+        let event = ring.completion().next().ok_or_else(|| Error::other("Failed to poll the bind event from the queue during compat check."))?;
+
+        if event.result() == -EINVAL {
+            IORING_BIND_SUPPORT.store(1, Ordering::Relaxed);
+        } else {
+            IORING_BIND_SUPPORT.store(0, Ordering::Relaxed);
+        }
+    }
+    if IORING_LISTEN_SUPPORT.load(Ordering::Relaxed) == 0 {
+        let listen = Listen::new(types::Fd(-1), 1000).build();
+         unsafe {
+            ring.submission().push(&listen).map_err(|_| Error::other("Failed to submit to submission queue."))?;
+        }
+
+        ring.submit_and_wait(1)?;
+
+        let event = ring.completion().next().ok_or_else(|| Error::other("Failed to poll the bind event from the queue during compat check."))?;
+
+        if event.result() == -EINVAL {
+            IORING_LISTEN_SUPPORT.store(1, Ordering::Relaxed);
+        } else {
+            IORING_LISTEN_SUPPORT.store(0, Ordering::Relaxed);
+        }
+    }
+
+    Ok(())
+}
+
+// pub fn supports_ioring_bind() -> bool {
+//     self.
+// }
 
 impl IoRingDriver {
     pub fn new(entries: u32) -> std::io::Result<Self> {
-        Ok(Self {
-            ring: RefCell::new(IoUring::builder().build(entries)?),
+        static TEST_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        
+        
+        let mut ring = IoUring::builder().build(entries)?;
+
+        // First we will check compatibility.
+        println!("Running compat check.");
+        perform_compatibility_checks(&mut ring)?;
+ // ring.submission().push(&)
+        
+        let mut object = Self {
+            ring: RefCell::new(ring),
             slab: Slab::with_capacity(entries as usize).into(),
-        })
+            support: IoRingSupport {
+                has_bind: IORING_BIND_SUPPORT.load(Ordering::Relaxed) == 2,
+                has_checked_bind: false,
+                has_listen: IORING_LISTEN_SUPPORT.load(Ordering::Relaxed) == 2,
+            },
+        };
+
+        // let ring= 
+
+        // object.support.has_bind = check_bind(&object).await?;
+        // match bind(&object, -1, TEST_ADDR).await {
+        //     Ok(_) => {
+        //         return Err(Error::other("Bound to file descriptor -1, which is almost certainly an error."));
+        //     },
+        //     Err(e) => {
+        //         if e.kind() != ErrorKind::InvalidInput {
+
+        //         }
+        //     }
+        // }
+
+        Ok(object)
+    }
+    pub fn supports_bind(&self) -> bool {
+        self.support.has_bind
+    }
+    pub fn supports_ioring_listen(&self) -> bool {
+        self.support.has_listen
     }
     pub fn register(&self, entry: squeue::Entry) -> IoPromise<'_> {
         IoPromise {
@@ -126,8 +237,6 @@ impl OwnedBuffer for Box<[u8]> {
     }
 }
 
-
-
 pub(crate) async fn socket(
     ring: &IoRingDriver,
     domain: i32,
@@ -167,12 +276,16 @@ async fn connect_ipv4(
 
 // #[inline]
 // fn with_addr_conversion<F>(addr: SocketAddr, functor: F)
-// where 
+// where
 //     F: FnOnce(*const sockaddr, u32) -> Box<>
 
+// fn has_ioring_bind() -> bool {
+//     static
+// }
+
 #[inline]
-fn ipv4_to_libc(ipv4: SocketAddrV4) -> sockaddr_in {
-sockaddr_in {
+pub fn ipv4_to_libc(ipv4: SocketAddrV4) -> sockaddr_in {
+    sockaddr_in {
         sin_family: AF_INET as u16,
         sin_addr: in_addr {
             s_addr: ipv4.ip().to_bits().to_be(),
@@ -192,6 +305,51 @@ fn ipv6_to_libc(ipv6: SocketAddrV6) -> sockaddr_in6 {
         sin6_port: ipv6.port().to_be(),
         sin6_flowinfo: ipv6.flowinfo(),
         sin6_scope_id: ipv6.scope_id(),
+    }
+}
+
+pub static IORING_BIND_SUPPORT: AtomicU8 = AtomicU8::new(0);
+pub static IORING_LISTEN_SUPPORT: AtomicU8 = AtomicU8::new(0);
+
+#[inline]
+async fn check_bind(ring: &IoRingDriver) -> std::io::Result<bool> {
+    // static DUMMY_IP: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+
+    let value = IORING_BIND_SUPPORT.load(std::sync::atomic::Ordering::Relaxed);
+
+    if value == 0 {
+        match uring_bind_ipv4(
+            ring,
+            -1,
+            &sockaddr_in {
+                sin_family: AF_INET as u16,
+                sin_port: 0,
+                sin_addr: in_addr { s_addr: 0 },
+                sin_zero: [0u8; 8],
+            },
+        )
+        .await
+        {
+            Ok(_) => {
+                return Err(Error::other(
+                    "We were able to bind to the file descriptor -1. This is weird.",
+                ));
+            }
+            Err(e) => {
+                // println!("error: {e:?}");
+                let result = if e.kind() == ErrorKind::InvalidInput {
+                    1
+                } else {
+                    2
+                };
+
+                IORING_BIND_SUPPORT.store(result, Ordering::Relaxed);
+
+                Ok(result == 2)
+            }
+        }
+    } else {
+        Ok(value == 2)
     }
 }
 
@@ -267,10 +425,38 @@ pub(crate) async fn close(ring: &IoRingDriver, fd: RawFd) -> std::io::Result<()>
 async fn bind_ipv4(
     ring: &IoRingDriver,
     socket: RawFd,
-    socket_addr: SocketAddrV4
+    socket_addr: SocketAddrV4,
 ) -> std::io::Result<()> {
     let address = Box::new(ipv4_to_libc(socket_addr));
-    let entry = Bind::new(types::Fd(socket), address.as_ref() as *const _ as *const sockaddr, size_of::<sockaddr_in>() as u32).build();
+
+    if ring.supports_bind() {
+        println!("binding...");
+        uring_bind_ipv4(ring, socket, &*address).await?;
+    } else {
+        unsafe {
+            nix::libc::bind(
+                socket,
+                address.as_ref() as *const _ as *const sockaddr,
+                size_of::<sockaddr_in>() as u32,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[inline]
+async fn uring_bind_ipv4(
+    ring: &IoRingDriver,
+    socket: RawFd,
+    addr: &sockaddr_in,
+) -> std::io::Result<()> {
+    let entry = Bind::new(
+        types::Fd(socket),
+        addr as *const _ as *const sockaddr,
+        size_of::<sockaddr_in>() as u32,
+    )
+    .build();
     let submission = ring.register(entry).await;
     if submission < 0 {
         return Err(Error::from_raw_os_error(-submission));
@@ -281,10 +467,15 @@ async fn bind_ipv4(
 async fn bind_ipv6(
     ring: &IoRingDriver,
     socket: RawFd,
-    socket_addr: SocketAddrV6
+    socket_addr: SocketAddrV6,
 ) -> std::io::Result<()> {
     let address = Box::new(ipv6_to_libc(socket_addr));
-    let entry = Bind::new(types::Fd(socket), address.as_ref() as *const _ as *const sockaddr, size_of::<sockaddr_in6>() as u32).build();
+    let entry = Bind::new(
+        types::Fd(socket),
+        address.as_ref() as *const _ as *const sockaddr,
+        size_of::<sockaddr_in6>() as u32,
+    )
+    .build();
     let submission = ring.register(entry).await;
     if submission < 0 {
         return Err(Error::from_raw_os_error(-submission));
@@ -294,59 +485,97 @@ async fn bind_ipv6(
 pub(crate) async fn bind(
     ring: &IoRingDriver,
     socket: RawFd,
-    socket_addr: SocketAddr
-) -> std::io::Result<()>{
+    socket_addr: SocketAddr,
+) -> std::io::Result<()> {
+    // if !ring.support.has_checked_bind {
+    //     ring.support.has_bind = check_bind(ring).await?;
+    //     ring.support.has_checked_bind = true;
+    // }
     match socket_addr {
         SocketAddr::V4(ipv4) => bind_ipv4(ring, socket, ipv4).await,
-        SocketAddr::V6(ipv6) => bind_ipv6(ring, socket, ipv6).await
+        SocketAddr::V6(ipv6) => bind_ipv6(ring, socket, ipv6).await,
     }
+}
+
+async fn bind_libc_sync(ring: &IoRingDriver, socket: RawFd, socket_addr: SocketAddr) {}
+
+pub(crate) async fn shutdown(ring: &IoRingDriver, socket: RawFd, how: i32) -> std::io::Result<()> {
+    let shutdown = Shutdown::new(types::Fd(socket), how).build();
+    let submision = ring.register(shutdown).await;
+    if submision < 0 {
+        return Err(Error::from_raw_os_error(-submision));
+    }
+    Ok(())
+}
+
+pub(crate) async fn timeout(ring: &IoRingDriver, duration: Duration) -> std::io::Result<()> {
+    let spec = Timespec::new()
+        .sec(duration.as_secs())
+        .nsec(duration.subsec_nanos());
+    let timeout = Timeout::new(&spec as *const _).build();
+    let submission = ring.register(timeout).await;
+    Ok(())
 }
 
 pub(crate) async fn listen(
     ring: &IoRingDriver,
     socket: RawFd,
-    backlog: i32
-    // socket_addr: SocketAddr
+    backlog: i32, // socket_addr: SocketAddr
 ) -> std::io::Result<()> {
-
-    let listen = Listen::new(types::Fd(socket), backlog);
+    if ring.supports_ioring_listen() {
+         let listen = Listen::new(types::Fd(socket), backlog);
     let submission = ring.register(listen.build()).await;
     if submission < 0 {
         return Err(Error::from_raw_os_error(-submission));
     }
+    } else {
+        let status = unsafe {
+            nix::libc::listen(socket, backlog)
+        };
+        if status < 0 {
+            return Err(Error::from_raw_os_error(-status));
+        }
+        
+    }
+   
     Ok(())
 }
 
 pub(crate) async fn accept(
     ring: &IoRingDriver,
     socket: RawFd,
-    flags: i32
+    flags: i32,
 ) -> std::io::Result<(RawFd, SocketAddr)> {
-
     let mut storage: Box<sockaddr> = unsafe { Box::new(zeroed()) };
     let mut len: Box<socklen_t> = unsafe { Box::new(zeroed()) };
 
-    let accept = Accept::new(types::Fd(socket), storage.as_mut() as *mut _, len.as_mut() as *mut _)
-        .flags(flags);
+    let accept = Accept::new(
+        types::Fd(socket),
+        storage.as_mut() as *mut _,
+        len.as_mut() as *mut _,
+    )
+    .flags(flags);
     let submission = ring.register(accept.build()).await;
     if submission < 0 {
         return Err(Error::from_raw_os_error(-submission));
     }
 
-    if storage.sa_family == AF_INET as u16 {
-
+    if *len as usize == size_of::<sockaddr_in>() {
         let ipv4_storage = unsafe { &*(storage.as_ref() as *const _ as *const sockaddr_in) };
 
-        let ipv4_address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_bits(ipv4_storage.sin_addr.s_addr.to_be()), ipv4_storage.sin_port.to_be()));
+        let ipv4_address = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::from_bits(ipv4_storage.sin_addr.s_addr.to_be()),
+            ipv4_storage.sin_port.to_be(),
+        ));
 
         Ok((submission, ipv4_address))
 
-
         // Ok((submission, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_bits(u32::from_be_bytes(bytes)), port))))
-    } else if storage.sa_family == AF_INET6 as u16 {
+    } else if *len as usize == size_of::<sockaddr_in6>() {
         return Err(Error::other("Unsupported protocol family."));
     } else {
-        return Err(Error::other("Unsupported protocol family."))
+        println!("protocol family: {}", storage.sa_family);
+        return Err(Error::other("Unsupported protocol family."));
     }
 
     // Ok(submission)
@@ -385,9 +614,6 @@ where
 
     (Ok(submission as usize), buffer)
 }
-
-
-
 
 // pub enum
 
