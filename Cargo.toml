@@ -1,0 +1,16 @@
+[package]
+name = "monorail"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.99"
+async-executor = { version = "1.13.2", features = ["static"] }
+flume = "0.11.1"
+io-uring = "0.7.10"
+nix = { version = "0.30.1", features = ["sched"] }
+num_cpus = "1.17.0"
+pin-project = "1.1.10"
+slab = "0.4.11"
+smol = "2.0.2"
+thiserror = "2.0.16"
