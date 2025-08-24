@@ -312,7 +312,8 @@ fn main() {
         // EBADF
 
         println!("advancing...");
-
+        println!("probe bind: {}", Probe::new().is_supported(Bind::CODE));
+        println!("probe read: {}", Probe::new().is_supported(Read::CODE));
         println!("Supports IORING BIND: {}", driver.supports_bind());
 
         // EFAULT

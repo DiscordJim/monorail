@@ -73,7 +73,7 @@ fn perform_compatibility_checks(ring: &mut IoUring) -> std::io::Result<()> {
         if event.result() == -EINVAL {
             IORING_BIND_SUPPORT.store(1, Ordering::Relaxed);
         } else {
-            IORING_BIND_SUPPORT.store(0, Ordering::Relaxed);
+            IORING_BIND_SUPPORT.store(2, Ordering::Relaxed);
         }
     }
     if IORING_LISTEN_SUPPORT.load(Ordering::Relaxed) == 0 {
@@ -89,7 +89,7 @@ fn perform_compatibility_checks(ring: &mut IoUring) -> std::io::Result<()> {
         if event.result() == -EINVAL {
             IORING_LISTEN_SUPPORT.store(1, Ordering::Relaxed);
         } else {
-            IORING_LISTEN_SUPPORT.store(0, Ordering::Relaxed);
+            IORING_LISTEN_SUPPORT.store(2, Ordering::Relaxed);
         }
     }
 
@@ -430,7 +430,7 @@ async fn bind_ipv4(
     let address = Box::new(ipv4_to_libc(socket_addr));
 
     if ring.supports_bind() {
-        println!("binding...");
+        // println!("binding...");
         uring_bind_ipv4(ring, socket, &*address).await?;
     } else {
         unsafe {
