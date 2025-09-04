@@ -2,7 +2,7 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc,
     },
     thread::{current, park, Thread},
@@ -97,18 +97,9 @@ pub enum PromiseError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::Arc,
-        task::{Context, Wake, Waker},
-    };
-
     use crate::core::channels::promise::{PromiseError, SyncPromise};
 
-    struct TestWaker {}
 
-    impl Wake for TestWaker {
-        fn wake(self: Arc<Self>) {}
-    }
 
     #[test]
     pub fn test_sync_promise() {

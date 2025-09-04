@@ -2,7 +2,7 @@
 import socket
 
 HOST = "127.0.0.1"
-PORT = 6942
+PORT = 49813
 
 def main():
     with socket.create_connection((HOST, PORT), timeout=5) as s:

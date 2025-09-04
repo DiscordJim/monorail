@@ -1,10 +1,36 @@
-use std::{ffi::CString, io::stdout, net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs}, os::fd::AsRawFd, time::{Duration, SystemTime}};
+use std::{
+    ffi::CString,
+    future::pending,
+    io::stdout,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
+    os::fd::AsRawFd,
+    process::exit,
+    time::{Duration, Instant, SystemTime},
+};
 
-use io_uring::{cqueue, opcode::{self, Accept, Bind, Connect, Read, Socket}, squeue, types, IoUring, Probe};
-use nix::libc::{self, sockaddr, sockaddr_in, AF_INET, EBADF, EFAULT, EINVAL, IPPROTO_TCP, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDONLY, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM};
-use smol::{future, LocalExecutor, Timer};
+use asyncnal::{EventSetter, LocalEvent};
+use io_uring::{
+    cqueue,
+    opcode::{self, Accept, Bind, Connect, Read, Socket},
+    squeue, types, IoUring, Probe,
+};
+use nix::libc::{
+    self, sockaddr, sockaddr_in, AF_INET, EBADF, EFAULT, EINVAL, IPPROTO_TCP, O_CLOEXEC, O_CREAT,
+    O_NONBLOCK, O_RDONLY, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM,
+};
+use smol::{
+    future::{self, yield_now, YieldNow},
+    LocalExecutor, Timer,
+};
 
-use crate::core::{io::ring::{accept, bind, close, connect, ipv4_to_libc, listen, openat, read, socket, timeout, write, IoRingDriver}, topology::MonorailTopology};
+use crate::core::{
+    executor::scheduler::Executor,
+    io::{net::{TcpListener, TcpStream}, ring::{
+        accept, bind, close, connect, install_timeout, ipv4_to_libc, listen, openat, read, socket,
+        timeout, write, IoRingDriver,
+    }},
+    topology::MonorailTopology,
+};
 
 pub mod core;
 
@@ -289,25 +315,122 @@ fn main() {
     //     sched_setaffinity(pid, cpusetsize, cpuset)
     // }
 
-   
+    let exec = Executor::new();
+
+    // let mut driver = IoRingDriver::new(512).unwrap();
+
+    // Timer::after(duration)
+
+    let event = LocalEvent::new();
+
+    // exec.spawn(async {
+    //     for i in 0..5 {
+    //         println!("Counting... {i}");
+
+    //         // Timer::after(Duration::from_millis(1)).await;
+    //         let insta = Instant::now();
+
+    //         exec.sleep(Duration::from_millis(5)).await;
+    //         println!("Elapsed: {:?}", insta.elapsed());
+    //     }
+    //     event.set_one();
+    // }).detach();;
+
+    // exec.spawn(async {
+    //     println!("I am waiting!");
+    //     // event.wait().await;
+    //     println!("I waited, and now we chillin.");
+
+    //     loop {
+
+    //         let mut duation = Instant::now();
+    //         // println!("Hey now!");
+    //         exec.sleep(Duration::from_secs(1)).await;
+    //         // Timer::after(Duration::from_secs(1)).await;
+    //         println!("Elapsed: {:?}", duation.elapsed());
+    //     }
+    // }).detach();;
+
+    // likely
+
+
+    exec.spawn(async {
+        //  let fd = openat(
+        //     &exec.io_uring(),
+        //     CString::new("README.md").unwrap().as_c_str(),
+        //     O_NONBLOCK | O_RDONLY,
+        //     0,
+        // )
+        // .await
+        // .unwrap();
+
+        // // // close(&driver, fd).await.unwrap();
+
+        // println!("HELLO");
+        // let bytes = read(&exec.io_uring(), fd, vec![0; 24]).await;
+
+
+        let mut listener = TcpListener::bind(exec.io_uring(), "0.0.0.0:0").await.unwrap();
+        let ad = listener.local_addr().unwrap();
+        println!("Hello {:?}", ad);
+
+        let lis = listener.accept().await.unwrap();
+        println!("HELLO");
+        // let mut buffer = vec![0u8; 512];
+        // let (r, buffer) = 
+
+        // let mut socket = TcpStream::connect(exec.io_uring(), "127.0.0.1:6968").await.unwrap();
+        // socket.write("hello").await;
+        // println!("FD: {bytes:?}");
+
+    }).detach();
+
+    future::block_on(exec.run(pending::<()>()));
+
+    exit(1);
+
     let executor = LocalExecutor::new().leak();
 
     future::block_on(executor.run(async {
-       
-         let driver = Box::leak(Box::new(IoRingDriver::new(8).unwrap()));
+        let driver = Box::leak(Box::new(IoRingDriver::new(8).unwrap()));
 
-        executor.spawn({
-            // let dref = &driver;
-            async {
-                loop {
-                    driver.drive();
-                    // println!("hello...");
+        executor
+            .spawn({
+                // let dref = &driver;
+                async {
+                    loop {
+                        // println!("Entering drive...");
+                        // yield_now().await;
 
-                    Timer::after(Duration::from_micros(50)).await;
+                        // println!("hello: {:?}", driver.len());
+                        // if driver.len() == 0 {
+
+                        // }
+
+                        // Timer::after(Duration::from_millis(250)).await;
+
+                        // println!("Executor: {}", executor.)
+
+                        driver.drive();
+                        // println!("hello...")
+
+                        // ;
+
+                        // driver.
+
+                        // install_timeout(&driver, Duration::from_secs(1))
+                        // driver.
+                        if driver.len() == 1 {
+                            driver.sub_and_wait().unwrap();
+                        }
+
+                        // println!("YESS!!");
+                        yield_now().await;
+                        // Timer::after(Duration::from(50)).await;
+                    }
                 }
-            }
-        }).detach();
-
+            })
+            .detach();
 
         // EBADF
 
@@ -324,44 +447,42 @@ fn main() {
         // bind(&driver, -1, "0.0.0.0:69".to_socket_addrs().unwrap().next().unwrap()).await.unwrap();
         // let socket = socket(&driver, A, socket_type, protocol)
 
-
         // let stdout = stdout();
         // let fs = stdout.as_raw_fd();
 
         // write(&driver, fs, "get hecked!\n".as_bytes().to_vec()).await.0.unwrap();
 
+        loop {
+            let time = SystemTime::now();
 
-        // let time = SystemTime::now();
+            println!("initiating...");
+            timeout(&driver, Duration::from_millis(10)).await.unwrap();
+            let elapsed = time.elapsed().unwrap();
+            println!("Elapsed: {:?}", elapsed);
+        }
+        // let socket = socket(&driver, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP).await.unwrap();
+        // println!("Socket: {socket}");
+        // // // EINVAL
 
-        // timeout(&driver, Duration::from_secs(5)).await.unwrap();
-        // let elapsed = time.elapsed().unwrap();
-        // println!("Elapsed: {:?}", elapsed);
-        let socket = socket(&driver, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP).await.unwrap();
-        println!("Socket: {socket}");
-        // // EINVAL
+        // // println!("Support: {}", Probe::new().is_supported(Socket::CODE));
 
-        
-        // println!("Support: {}", Probe::new().is_supported(Socket::CODE));
+        // // let ie = ipv4_to_libc(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6942));
 
+        // // let bruh = unsafe { libc::bind(socket, &ie as *const _ as *const sockaddr, size_of::<sockaddr_in>() as u32 ) };
+        // // println!("bruh: {:?}", bruh);
+        // bind(&driver, socket, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6942))).await.unwrap();
+        // // let listen = unsafe { libc::listen(socket, 1000) };
+        // // println!("listen: {listen}");
+        // listen(&driver, socket, 1000).await.unwrap();
 
-        // let ie = ipv4_to_libc(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6942));
+        // let accept = accept(&driver, socket, SOCK_CLOEXEC | SOCK_NONBLOCK).await.unwrap();
 
-
-        // let bruh = unsafe { libc::bind(socket, &ie as *const _ as *const sockaddr, size_of::<sockaddr_in>() as u32 ) };
-        // println!("bruh: {:?}", bruh);
-        bind(&driver, socket, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6942))).await.unwrap();
-        // let listen = unsafe { libc::listen(socket, 1000) };
-        // println!("listen: {listen}");
-        listen(&driver, socket, 1000).await.unwrap();
-
-        let accept = accept(&driver, socket, SOCK_CLOEXEC | SOCK_NONBLOCK).await.unwrap();
-
-        println!("Accepted: {:?}", accept);
+        // println!("Accepted: {:?}", accept);
 
         // let mut buffer = vec![0; 128];
 
         // let (r, o) = read(&driver, accept.0, buffer).await;
-        
+
         // println!("{o:?}");
 
         // let addy = "0.0.0.0:6969".to_socket_addrs().unwrap().next().unwrap();
@@ -385,7 +506,7 @@ fn main() {
 
         // let fd = openat(&driver, CString::new("README.md").unwrap().as_c_str(), O_RDONLY, 0).await.unwrap();
 
-        // // close(&driver, fd).await.unwrap();
+        // // // close(&driver, fd).await.unwrap();
 
         // let bytes = read(&driver, fd, vec![0; 24]).await.unwrap();
 
@@ -398,7 +519,6 @@ fn main() {
         // let buffer = read(&driver, fd.as_raw_fd(), buf).await.unwrap();
 
         // // let write = opcode::Read::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), buf.len() as _).build();
-
 
         // // // EBADF
         // // let entity = driver.register(write).await;

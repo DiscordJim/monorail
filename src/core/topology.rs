@@ -1,4 +1,4 @@
-use std::{thread::park, time::Duration};
+use std::thread::park;
 
 use flume::Sender;
 
