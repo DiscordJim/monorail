@@ -49,6 +49,8 @@ impl ShardActorOffice {
 
         // self.reverse.insert(TypeId::<, v)
 
+        // println!("CoRE: {:?}", core);
+
         Ok((
             FornAddr {
                 signal: FornSignalHandle {

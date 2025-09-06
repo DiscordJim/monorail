@@ -66,7 +66,7 @@ impl<'a> Executor<'a> {
 
         let obj = Self {
             state: ExecutorState {
-                id: ShardId::new(0),
+                id: core,
                 office: ShardActorOffice::new().into(),
                 queue: RefCell::default(),
                 mt_queue: UnboundedQueue::new(),

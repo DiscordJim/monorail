@@ -10,7 +10,7 @@ use smol::{future::race, Task};
 
 use crate::core::{actor::futures::BoxedCall, channels::promise::Promise, executor::{
     helper::{select2, Select2Result}, mail::MailId, scheduler::Executor
-}, shard::{shard::{self, get_actor_addr, signal_actor_mailbox, spawn_async_task, submit_to}, state::{ShardId, ShardRuntime}}};
+}, shard::{shard::{self, get_actor_addr, shard_id, signal_actor_mailbox, spawn_async_task, submit_to}, state::{ShardId, ShardRuntime}}};
 
 pub trait ActorCall<M>: Actor {
     type Output;
@@ -57,6 +57,9 @@ where
 
         let (tx, rx) = oneshot::channel();
         submit_to(core, |_| {
+
+            // println!("Starttin g on {:?}", shard_id());
+
             match shard::spawn_actor(arguments) {
                 Ok((actor, _)) => {
                     let _ = tx.send(Ok(actor));
@@ -463,6 +466,7 @@ where
 }
 
 
+#[derive(Debug)]
 // Foreign Addresses -- Allow us to 
 // send to an actor from another thread.
 pub struct FornAddr<A>
@@ -473,6 +477,7 @@ where
     pub(crate) _marker: PhantomData<A>
 }
 
+#[derive(Debug)]
 pub struct FornSignalHandle {
     pub(crate) shard: ShardId,
     pub(crate) mail: MailId

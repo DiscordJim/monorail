@@ -194,6 +194,10 @@ pub fn get_topology_info() -> &'static TopologicalInformation {
     &access_shard_ctx_ref().top_info
 }
 
+pub fn shard_id() -> ShardId {
+    access_shard_ctx_ref().id
+}
+
 fn perform_core_bind(
     core: ShardId,
     core_count: usize,
