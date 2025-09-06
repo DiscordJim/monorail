@@ -1,5 +1,5 @@
 use std::{
-    future::Future, marker::PhantomData, ops::Deref, rc::Rc
+    cell::RefCell, future::Future, marker::PhantomData, ops::Deref, rc::Rc,
 };
 
 use anyhow::{anyhow, Result};
@@ -8,9 +8,19 @@ use flume::{Receiver, Sender};
 use futures::channel::oneshot;
 use smol::{future::race, Task};
 
-use crate::core::{actor::futures::BoxedCall, channels::promise::Promise, executor::{
-    helper::{select2, Select2Result}, mail::MailId, scheduler::Executor
-}, shard::{shard::{self, get_actor_addr, signal_actor_mailbox, spawn_async_task, submit_to}, state::ShardId}};
+use crate::core::{
+    actor::futures::BoxedCall,
+    channels::promise::Promise,
+    executor::{
+        helper::{select2, Select2Result},
+        mail::MailId,
+        scheduler::Executor,
+    },
+    shard::{
+        shard::{self, get_actor_addr, signal_actor_mailbox, spawn_async_task, submit_to},
+        state::ShardId,
+    },
+};
 
 pub trait ActorCall<M>: Actor {
     type Output;
@@ -27,12 +37,10 @@ struct SubTaskHandle {
     handle: SignalHandle,
 }
 
-
-
 struct InternalActorRunCtx {
     executor: &'static Executor<'static>,
     tasks: Vec<SubTaskHandle>,
-    foreigns: Vec<FornSignalHandle>
+    foreigns: Vec<FornSignalHandle>,
 }
 
 pub struct SelfAddr<'a, A>
@@ -40,7 +48,6 @@ where
     A: Actor,
 {
     addr: &'a Addr<A>,
-    // executor: &'a Executor<'a>,
     internal: &'a mut InternalActorRunCtx,
 }
 
@@ -48,16 +55,18 @@ impl<'a, A> SelfAddr<'a, A>
 where
     A: Actor,
 {
-    pub async fn spawn_linked_foreign<B>(&mut self, core: ShardId, arguments: B::Arguments) -> Result<FornAddr<B>>
-    where 
+    pub async fn spawn_linked_foreign<B>(
+        &mut self,
+        core: ShardId,
+        arguments: B::Arguments,
+    ) -> Result<FornAddr<B>>
+    where
         B: Actor,
         B::Message: Send + 'static,
-        B::Arguments: Send + 'static
+        B::Arguments: Send + 'static,
     {
-
         let (tx, rx) = oneshot::channel();
-        submit_to(core, |_| {
-
+        submit_to(core, async || {
             // println!("Starttin g on {:?}", shard_id());
 
             match shard::spawn_actor(arguments) {
@@ -70,14 +79,12 @@ where
             }
             // let (foreign, local) = shard::spawn_actor(arguments);
         });
-        
+
         let handler = rx.await??;
 
         self.internal.foreigns.push(handler.clone().signal);
 
-
         Ok(handler)
-
     }
     pub async fn spawn_linked<B>(&mut self, arguments: B::Arguments) -> Result<()>
     where
@@ -85,7 +92,7 @@ where
     {
         let (actor, handle) = spawn_actor::<B>(self.internal.executor, arguments)?;
         self.internal.tasks.push(SubTaskHandle {
-            handle: actor.raw.signal_handle,
+            handle: actor.raw.signal_handle.clone(),
             task: handle,
         });
 
@@ -107,14 +114,10 @@ where
 
         let ks = signal.kill_signal.clone();
         let loopa = self.internal.executor.spawn(async move {
-            // println!("Starting future...");
             let _ = race(fut, async {
                 let _ = select2(s_rx.recv_async(), ks.wait()).await;
             })
             .await;
-            // fut.await;
-
-            // race(fut, async { })
         });
 
         self.internal.tasks.push(SubTaskHandle {
@@ -150,7 +153,9 @@ pub(crate) struct SignalHandle {
 
 impl SignalHandle {
     pub fn stop(&self) -> Result<()> {
-        self.signal_channel.send(ActorSignal::Stop).map_err(|_| anyhow::anyhow!("Failed to send signal."))?;
+        self.signal_channel
+            .send(ActorSignal::Stop)
+            .map_err(|_| anyhow::anyhow!("Failed to send signal."))?;
         Ok(())
     }
     pub fn kill(&self) {
@@ -159,7 +164,7 @@ impl SignalHandle {
 }
 
 // #[derive(Clone)]
-struct RawHandle<A>
+pub(crate) struct RawHandle<A>
 where
     A: Actor,
 {
@@ -190,12 +195,11 @@ where
     match multi {
         Select2Result::Left(a) => match a? {
             NormalActorMessage::Call(call) => Ok(ActorMessage::Call(call)),
-            NormalActorMessage::Message(me) => Ok(ActorMessage::Message(me))
+            NormalActorMessage::Message(me) => Ok(ActorMessage::Message(me)),
         },
         Select2Result::Right(b) => Ok(ActorMessage::Signal(b?)),
     }
 }
-
 
 #[allow(unused_variables)]
 /// Actors are the basic unit of concurrency in monorail. Please note that
@@ -231,13 +235,11 @@ pub trait Actor: Sized + 'static {
     }
 }
 
-
-
 pub struct Addr<T>
 where
     T: Actor,
 {
-    raw: RawHandle<T>,
+    raw: Rc<RawHandle<T>>,
     _marker: PhantomData<T>,
 }
 
@@ -245,11 +247,29 @@ impl<T> Addr<T>
 where
     T: Actor,
 {
-    pub(crate) fn downgrade(self) -> SignalHandle {
-        self.raw.signal_handle
+    /// SAFETY: The pointer needs to be non-null.
+    pub(crate) unsafe fn from_raw(this: *const RawHandle<T>) -> Self
+    where
+        T: Actor,
+    {
+        Self {
+            raw: Rc::from_raw(this),
+            _marker: PhantomData,
+        }
+    }
+    pub(crate) fn to_raw_ptr(&self) -> *const RawHandle<T> {
+        Rc::into_raw(self.raw.clone())
+    }
+    pub(crate) fn get_signal(self) -> SignalHandle {
+        self.raw.signal_handle.clone()
     }
     pub async fn send(&self, message: T::Message) -> Result<(), T::Message> {
-        if let Err(e) = self.raw.msg_channel.send_async(NormalActorMessage::Message(message)).await {
+        if let Err(e) = self
+            .raw
+            .msg_channel
+            .send_async(NormalActorMessage::Message(message))
+            .await
+        {
             // retu
             if let NormalActorMessage::Message(m) = e.into_inner() {
                 return Err(m);
@@ -275,10 +295,17 @@ where
     }
 }
 
+thread_local! {
+    pub static TEST_NAME: RefCell<String> = RefCell::new(String::new());
+}
 
+pub fn set_test_name(name: String) {
+    TEST_NAME.with(|f| *f.borrow_mut() = name);
+}
 
-
-
+pub fn get_test_name() -> String {
+    TEST_NAME.with(|f| f.borrow().clone())
+}
 
 impl<T> Addr<T>
 where
@@ -291,9 +318,17 @@ where
     {
         let (tx, rx) = Promise::new();
         let boxed: BoxedCall<T> = Box::new(move |this, state| {
+            // println!("{} [D] Entering call block. {:?}", get_test_name(), thread::current().id());
             let fut = <T as ActorCall<P>>::call(this, param, state);
+            // println!("{} [D] Created a call. {:?}", get_test_name(), thread::current().id());
             Box::pin(async move {
-                let _ = rx.resolve(fut.await);
+                // println!("{} [D] Entering async. {:?}", get_test_name(), thread::current().id());
+
+                let re = fut.await;
+                //  println!("{} [D] Resolved fucn async. {:?}", get_test_name(), thread::current().id());
+
+                let _ = rx.resolve(re);
+                // println!("{} [D] Exiting async. {:?}", get_test_name(), thread::current().id());
             })
         });
 
@@ -302,6 +337,7 @@ where
             .send_async(NormalActorMessage::Call(boxed))
             .await
             .map_err(|_| anyhow!("Failed to send."))?;
+        // println!("{} [D] Sent a call. {:?}", get_test_name(), thread::current().id());
 
         tx.await.map_err(|_| anyhow!("Call canceled."))
     }
@@ -326,11 +362,11 @@ pub enum ActorMessage<T: Actor> {
 }
 
 enum NormalActorMessage<T>
-where 
-    T: Actor
+where
+    T: Actor,
 {
     Call(BoxedCall<T>),
-    Message(T::Message)
+    Message(T::Message),
 }
 
 async fn actor_action_loop<A>(
@@ -350,10 +386,17 @@ where
                     break Ok(sig);
                 }
                 ActorMessage::Call(call) => {
-                    println!("Received a call...");
-                    call(SelfAddr { addr: addr, internal: ctx }, state).await;
+                    // println!("Received a call...");
+                    call(
+                        SelfAddr {
+                            addr: addr,
+                            internal: ctx,
+                        },
+                        state,
+                    )
+                    .await;
+                    // println!("Terminated call...");
                     // call(SelfAddr { addr: addr, internal: ctx }, state);
-
                 }
                 ActorMessage::Message(msg) => {
                     let _ = A::handle(
@@ -368,7 +411,7 @@ where
                 }
             },
             Err(e) => {
-                println!("Failed to receive!");
+                // println!("Failed to receive!");
             }
         }
     }
@@ -389,17 +432,17 @@ where
     let mut context = InternalActorRunCtx {
         executor,
         tasks: vec![],
-        foreigns: vec![]
+        foreigns: vec![],
     };
 
     let addr = Addr {
-        raw: RawHandle {
+        raw: Rc::new(RawHandle {
             msg_channel: msg_tx,
             signal_handle: SignalHandle {
                 signal_channel: sig_tx,
                 kill_signal: Rc::new(LocalEvent::new()),
             },
-        },
+        }),
         _marker: PhantomData::<A>,
     };
 
@@ -465,48 +508,44 @@ where
     Ok((addr, task))
 }
 
-
 #[derive(Debug)]
-// Foreign Addresses -- Allow us to 
+// Foreign Addresses -- Allow us to
 // send to an actor from another thread.
 pub struct FornAddr<A>
-where 
-    A: Actor
+where
+    A: Actor,
 {
     pub(crate) signal: FornSignalHandle,
-    pub(crate) _marker: PhantomData<A>
+    pub(crate) _marker: PhantomData<A>,
 }
 
 #[derive(Debug)]
 pub struct FornSignalHandle {
     pub(crate) shard: ShardId,
-    pub(crate) mail: MailId
+    pub(crate) mail: MailId,
 }
 
-
 impl<A> Clone for FornAddr<A>
-where 
-    A: Actor
+where
+    A: Actor,
 {
     fn clone(&self) -> Self {
         Self {
             signal: FornSignalHandle {
                 mail: self.signal.mail,
-                shard: self.signal.shard
+                shard: self.signal.shard,
             },
             _marker: PhantomData,
         }
     }
 }
 
-
-
 impl FornSignalHandle {
     pub async fn stop(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
 
         let id = self.mail;
-        submit_to(self.shard, move |_| {
+        submit_to(self.shard, async move || {
             match signal_actor_mailbox(id, ActorSignal::Stop) {
                 Ok(v) => {
                     let _ = tx.send(Ok(v));
@@ -524,7 +563,7 @@ impl FornSignalHandle {
         let (tx, rx) = oneshot::channel();
 
         let id = self.mail;
-        submit_to(self.shard, move |_| {
+        submit_to(self.shard, async move || {
             match signal_actor_mailbox(id, ActorSignal::Kill) {
                 Ok(v) => {
                     let _ = tx.send(Ok(v));
@@ -539,19 +578,15 @@ impl FornSignalHandle {
     }
 }
 
-unsafe impl<A> Send for FornAddr<A>
-where 
-    A: Actor {}
+unsafe impl<A> Send for FornAddr<A> where A: Actor {}
 
 impl<A> FornAddr<A>
-where 
-    A: Actor
+where
+    A: Actor,
 {
-
-    pub async fn stop(&self) -> anyhow::Result<()>
-    {
+    pub async fn stop(&self) -> anyhow::Result<()> {
         // let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
-        
+
         // let addr2 = self.clone();
         // submit_to(self.shard, |_| {
         //     let Some(addr) = get_actor_addr(addr2) else {
@@ -586,11 +621,11 @@ where
 
     // async fn access_actor_remotely(&self, F)
     pub async fn kill(&self) -> anyhow::Result<()>
-    // where
+// where
         // A::Message: Send + 'static
     {
         // let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
-        
+
         // let addr2 = self.clone();
         // submit_to(self.shard, |_| {
         //     let Some(addr) = get_actor_addr(addr2) else {
@@ -603,34 +638,37 @@ where
     }
     pub async fn send(&self, message: A::Message) -> anyhow::Result<()>
     where
-        A::Message: Send + 'static
+        A::Message: Send + 'static,
     {
         let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
-        
+
         let addr2 = self.clone();
-        submit_to(self.signal.shard, |_| {
+        submit_to(self.signal.shard, async move || {
             let Some(addr) = get_actor_addr(addr2) else {
-                let _ = tx.send(Err((anyhow!("Failed to actually find the actor on the other core."))));
+                let _ = tx.send(Err((anyhow!(
+                    "Failed to actually find the actor on the other core."
+                ))));
                 return;
             };
 
             spawn_async_task(async move {
-                 match addr.send(message).await {
+                match addr.send(message).await {
                     Ok(v) => {
                         let _ = tx.send(Ok(v));
                     }
-                    Err(e) => {
+                    Err(_) => {
                         let _ = tx.send(Err((anyhow!("Failed to send."))));
                     }
                 }
-            }).detach();
+            })
+            .detach();
         });
 
         match rx.await {
             Ok(a) => {
                 return a;
             }
-            Err(e) => return Err(anyhow!("Failed"))
+            Err(e) => return Err(anyhow!("Failed")),
         }
         Ok(())
 
@@ -642,47 +680,50 @@ where
         A: ActorCall<P>,
         A::Output: Send,
         P: Send + 'static,
-        A::Message: Send + 'static
+        A::Message: Send + 'static,
     {
+        // static WHAT: smol::lock::Mutex<()> = smol::lock::Mutex::new(());
+        // let _handle = WHAT.lock().await;
 
         let addr2 = self.clone();
 
         let (tx, rx) = oneshot::channel();
 
-
-        submit_to(self.signal.shard, |_| {
+        // println!("[C] Started a call. {:?}", thread::current().id());
+        submit_to(self.signal.shard, async move || {
             // spawn_async_task(future)
             let Some(addr) = get_actor_addr(addr2) else {
-                let _ = tx.send(Err(anyhow!("Failed to actually find the actor on the other core.")));
+                let _ = tx.send(Err(anyhow!(
+                    "Failed to actually find the actor on the other core."
+                )));
                 return;
             };
+            // println!("[C] Actor address. {:?}", thread::current().id());
 
             spawn_async_task(async move {
-                 match addr.call(param).await {
+                // println!("[C] Spawned fetcher. {:?}", thread::current().id());
+                match addr.call(param).await {
                     Ok(v) => {
+                        // println!("[C] Resolved a call OK. {:?}", thread::current().id());
                         let _ = tx.send(Ok(v));
                     }
                     Err(e) => {
+                        // println!("[C] Resolved a call ERR. {:?}", thread::current().id());
                         let _ = tx.send(Err(e));
                     }
                 }
-            }).detach();
-
-           
+            })
+            .detach();
 
             // let output = addr.call(param).await
-
         });
 
+        let r = Ok(rx.await??);
 
-
-     
-
-        Ok(rx.await??)
-
+        // drop(_handle);
+        r
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -693,7 +734,8 @@ mod tests {
 
     use crate::core::{
         actor::base::{spawn_actor, Actor, ActorCall},
-        executor::scheduler::Executor, shard::state::ShardId,
+        executor::scheduler::Executor,
+        shard::state::ShardId,
     };
 
     #[test]
@@ -989,7 +1031,7 @@ mod tests {
 
         impl Drop for DropAnchor {
             fn drop(&mut self) {
-                println!("gone");
+                // println!("gone");
                 let _ = self.0.send(5);
             }
         }
@@ -1022,9 +1064,7 @@ mod tests {
         let executor = Executor::new(ShardId::new(0)).leak();
         smol::future::block_on(executor.run(async {
             let (tx, rx) = flume::unbounded();
-            let (actor, handle) =
-                spawn_actor::<IntervalCancelActor>(executor, tx.clone())?;
-
+            let (actor, handle) = spawn_actor::<IntervalCancelActor>(executor, tx.clone())?;
 
             assert_eq!(rx.recv_async().await?, 4);
 
@@ -1060,10 +1100,10 @@ mod tests {
         impl ActorCall<usize> for BasicActor {
             type Output = usize;
             async fn call<'a>(
-                    _: super::SelfAddr<'a, Self>,
-                    msg: usize,
-                    _: &'a mut Self::State,
-                ) -> Self::Output {
+                _: super::SelfAddr<'a, Self>,
+                msg: usize,
+                _: &'a mut Self::State,
+            ) -> Self::Output {
                 msg + 1
             }
         }
@@ -1071,31 +1111,30 @@ mod tests {
         impl ActorCall<bool> for BasicActor {
             type Output = bool;
             async fn call<'a>(
-                    _: super::SelfAddr<'a, Self>,
-                    msg: bool,
-                    _: &'a mut Self::State,
-                ) -> Self::Output {
+                _: super::SelfAddr<'a, Self>,
+                msg: bool,
+                _: &'a mut Self::State,
+            ) -> Self::Output {
                 !msg
             }
         }
 
         let executor = Executor::new(ShardId::new(0)).leak();
         smol::future::block_on(executor.run(async {
-
             let (actor, handle) = spawn_actor::<BasicActor>(executor, ())?;
-            
+
             let hi = actor.call(3).await?;
             assert_eq!(hi, 4);
 
             assert_eq!(actor.call(true).await?, false);
             assert_eq!(actor.call(false).await?, true);
 
-
             actor.stop().await?;
             handle.await;
 
             Ok::<_, anyhow::Error>(())
-        })).unwrap();
+        }))
+        .unwrap();
 
         // impl ActorCall<usize> for BasicActor {
         //     fn call<'a>(
@@ -1103,7 +1142,7 @@ mod tests {
         //             msg: usize,
         //             state: &'a mut Self::State,
         //         ) -> Self::Fut<'a> {
-                
+
         //     }
 
         // }

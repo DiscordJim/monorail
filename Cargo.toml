@@ -12,6 +12,7 @@ fastrand = "2.3.0"
 flume = "0.11.1"
 futures = "0.3.31"
 ghost-cell = "0.2.6"
+heapless = "0.9.1"
 io-uring = "0.7.10"
 lfqueue = "0.8.1"
 nix = { version = "0.30.1", features = ["event", "fs", "net", "sched", "socket"] }

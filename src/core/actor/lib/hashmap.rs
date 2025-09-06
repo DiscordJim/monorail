@@ -113,19 +113,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{actor::lib::hashmap::ShardedHashMap, shard::{shard::{signal_monorail, submit_task_to}, state::ShardId}, topology::{MonorailConfiguration, MonorailTopology}};
+    use crate::core::{actor::lib::hashmap::ShardedHashMap, shard::{shard::{signal_monorail, submit_to}, state::ShardId}, topology::{MonorailConfiguration, MonorailTopology}};
 
 
     #[test]
-    pub fn test_distributed_hashmap() {
+    pub fn test_router_distributed_hashmap() {
 
         MonorailTopology::setup(
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
             |_| {
-                submit_task_to(ShardId::new(0), async move || {
+                submit_to(ShardId::new(0), async move || {
                     let map = ShardedHashMap::<String, usize>::new().unwrap();
+
+                    // Timer::after(Duration::from_millis(250)).await;
 
                     map.insert("hello".to_string(), 4).await.unwrap();
                     map.insert("bye".to_string(), 3).await.unwrap();

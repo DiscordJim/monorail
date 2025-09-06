@@ -13,7 +13,6 @@ use crate::core::{
     actor::base::{Actor, ActorSignal, Addr, FornAddr}, executor::{backoff::{AdaptiveBackoff, BackoffResult}, mail::{MailId, ShardActorOffice}}, io::{fs::OpenOptions, ring::{install_polladd_multi, install_timeout, timeout, Claim, IoRingDriver}, FromRing}, shard::state::ShardId
 };
 use async_task::{Builder, Runnable};
-use futures::{executor::LocalPool, task::{LocalSpawnExt, SpawnExt}};
 use io_uring::{squeue::PushError, types::Timespec};
 use lfqueue::UnboundedQueue;
 use nix::sys::eventfd::{EfdFlags, EventFd};
@@ -46,7 +45,6 @@ struct ExecutorState {
     ring: IoRingDriver,
     // token: GhostToken<'static>,
     origin: ThreadId, // notify: RefCell<Option<Waker>>,
-                      // is_awake: Cell<bool>
 }
 
 impl<'a> Drop for ExecutorState {
@@ -104,7 +102,7 @@ impl<'a> Executor<'a> {
     where 
         A: Actor
     {
-        self.state.office.borrow().lookup_address::<A>(addr.signal.mail).cloned()
+        self.state.office.borrow().lookup_address::<A>(addr.signal.mail)
 
     }
 
@@ -300,7 +298,7 @@ mod tests {
             type Output = ();
             fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
                 
-                println!("Polling: {}", self.name);
+                // println!("Polling: {}", self.name);
                 self.source.send((self.name, cx.waker().clone())).unwrap();
 
                 Poll::Pending

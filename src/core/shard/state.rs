@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
 
+use crate::core::channels::bridge::{Bridge, BridgeConsumer, BridgeProducer, Rx, Tx};
 use crate::core::channels::promise::SyncPromiseResolver;
 use crate::core::executor::scheduler::Executor;
 use crate::core::topology::TopologicalInformation;
@@ -57,7 +58,7 @@ impl ShardRuntime {
 }
 
 pub struct ShardMapTable {
-    pub table: Box<[ShardMapEntry]>
+    pub table: Box<[Bridge]>
 }
 
 
@@ -70,7 +71,7 @@ pub struct ShardMapEntry {
 impl ShardMapTable {
     pub(crate) fn initialize<F>(cores: usize, functor: F) -> Result<Self, ShardError>
     where 
-        F: FnOnce(&mut [Option<ShardMapEntry>]) -> Result<(), ShardError>
+        F: FnOnce(&mut [Option<Bridge>]) -> Result<(), ShardError>
     {
 
         let mut array = Vec::with_capacity(cores);
@@ -92,11 +93,20 @@ pub(crate) enum ShardConfigMsg {
     // WaitReady(flume::Sender<()>),
     ConfigureExternalShard {
         target_core: ShardId,
-        queue: Sender<Task>
+        consumer: BridgeProducer<Rx>
     },
-    RequestEntry {
-        // requester: ShardId,
-        queue: SyncPromiseResolver<Sender<Task>>
+    StartConfiguration {
+        /// The core that wishes to establish a bridge.
+        requester: ShardId,
+
+        
+
+        /// The resolver which contains the consumer for
+        /// messages from the shard receiving this message.
+        /// 
+        /// The first item of the tuple is the consumer for receiving
+        /// and the second item is the producer for sending.
+        queue: SyncPromiseResolver<BridgeProducer<Rx>>
     },
     FinalizeConfiguration(SyncPromiseResolver<()>)
 }

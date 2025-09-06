@@ -1,32 +1,66 @@
 use std::{
-    any::Any,
     collections::HashMap,
-    marker::PhantomData,
+    marker::PhantomData, rc::Rc,
 };
 
 use anyhow::{anyhow, Ok};
+use slab::Slab;
 
 use crate::core::{
-    actor::base::{spawn_actor, Actor, ActorSignal, Addr, FornAddr, FornSignalHandle, SignalHandle},
+    actor::base::{spawn_actor, Actor, ActorSignal, Addr, FornAddr, FornSignalHandle, RawHandle, SignalHandle},
     executor::scheduler::Executor,
     shard::state::ShardId,
 };
 
+
+struct AddrVTable {
+    /// The actual data contained within the [Rc].
+    payload: *const (),
+    /// The function to decrement the reference count.
+    /// We need this to actually properly perform drops
+    /// on the table.
+    _decref: fn(*const ()),
+}
+
+#[inline]
+fn build_addr_vtable<A>(handle: &Addr<A>) -> AddrVTable
+where 
+    A: Actor
+{
+    AddrVTable {
+        payload: handle.to_raw_ptr().cast(),
+        _decref: |ptr| unsafe {
+            Rc::from_raw(ptr.cast::<RawHandle<A>>());
+        }
+    }
+}
+
+impl Drop for AddrVTable {
+    fn drop(&mut self) {
+        (self._decref)(self.payload)
+    }
+}
+
+struct ActorCtx {
+    /// A type-erased pointer to an actor. This is actually
+    /// a pointer to the [RawHandle] type which is parameterized
+    /// with the actor type.
+    address: AddrVTable,
+    /// The signal handler for the address.
+    signal_chart: SignalHandle
+}
+
 /// Issues mail addresses so it can
 /// direct messages around
 pub(crate) struct ShardActorOffice {
-    reverse: HashMap<MailId, Box<dyn Any>>,
-    signal_chart: HashMap<MailId, SignalHandle>,
-    id_count: usize,
-    // free_list: Vec<usize>
+    map: Slab<ActorCtx>,
 }
 
 impl ShardActorOffice {
     pub fn new() -> Self {
         Self {
-            reverse: HashMap::new(),
-            signal_chart: HashMap::new(),
-            id_count: 0,
+            map: Slab::new(),
+            // id_count: 0,
         }
     }
     pub fn spawn_actor<A>(
@@ -41,15 +75,11 @@ impl ShardActorOffice {
         let (addr, task) = spawn_actor(executor, arguments)?;
 
         task.detach();
-        let id = self.id_count;
-        self.id_count += 1;
 
-        self.reverse.insert(MailId(id), Box::new(addr.clone()));
-        self.signal_chart.insert(MailId(id), addr.clone().downgrade());
-
-        // self.reverse.insert(TypeId::<, v)
-
-        // println!("CoRE: {:?}", core);
+        let id = self.map.insert(ActorCtx {
+            address: build_addr_vtable(&addr),
+            signal_chart: addr.clone().get_signal()
+        });
 
         Ok((
             FornAddr {
@@ -63,19 +93,26 @@ impl ShardActorOffice {
         ))
     }
     #[inline]
-    pub fn lookup_address<A>(&self, mail_id: MailId) -> Option<&Addr<A>>
+    fn lookup_entry(&self, mail_id: MailId) -> Option<&ActorCtx> {
+        self.map.get(mail_id.0)
+    }
+    #[inline]
+    pub fn lookup_address<A>(&self, mail_id: MailId) -> Option<Addr<A>>
     where
         A: Actor,
     {
-        self.reverse
-            .get(&mail_id)
-            .map(|f| f.downcast_ref())
-            .flatten()
+        let address = &self.lookup_entry(mail_id)?.address;
+        let raw_handle = address.payload.cast::<RawHandle<A>>();
+        unsafe {
+            // Bump the refcount.
+            Rc::increment_strong_count(raw_handle);
+            Some(Addr::from_raw(raw_handle))
+        }
     }
     #[inline]
     pub fn signal_address(&self, mail_id: MailId, signal: ActorSignal) -> anyhow::Result<()> {
 
-        let signalhandler = self.signal_chart.get(&mail_id).ok_or_else(|| anyhow!("Failed to find address."))?;
+        let signalhandler = &self.lookup_entry(mail_id).ok_or_else(|| anyhow!("Failed to find entry."))?.signal_chart;
         match signal {
             ActorSignal::Kill => signalhandler.kill(),
             ActorSignal::Stop => signalhandler.stop()?
@@ -97,7 +134,7 @@ mod tests {
     use futures::channel::oneshot;
 
     use crate::core::{
-        actor::base::{Actor, ActorCall, SelfAddr}, shard::{shard::{signal_monorail, spawn_actor, submit_task_to}, state::ShardId}, topology::{MonorailConfiguration, MonorailTopology}
+        actor::base::{Actor, ActorCall, SelfAddr}, shard::{shard::{signal_monorail, spawn_actor, submit_to}, state::ShardId}, topology::{MonorailConfiguration, MonorailTopology}
     };
 
     #[test]
@@ -141,7 +178,7 @@ mod tests {
                 .build(),
             |_| {
                 let (foreign, _) = spawn_actor::<BasicActor>(()).expect("Failed to create basic actor.");
-                submit_task_to(ShardId::new(1), async move || {
+                submit_to(ShardId::new(1), async move || {
                     assert_eq!(foreign.call(1).await.expect("Failed to get result."), 2);
                     assert_eq!(foreign.call(2).await.expect("Failed to get result."), 3);
 

@@ -1,4 +1,4 @@
-use std::{any::Any, cell::UnsafeCell, future::Future, panic::AssertUnwindSafe, pin::Pin, rc::Rc, task::{Context, Poll}};
+use std::{any::Any, cell::UnsafeCell, collections::HashMap, future::Future, hash::Hash, panic::AssertUnwindSafe, pin::Pin, rc::Rc, task::{Context, Poll}};
 
 use nix::{
     sched::{sched_setaffinity, CpuSet},
@@ -7,7 +7,7 @@ use nix::{
 use smol::{future::{self, FutureExt}, LocalExecutor};
 use static_rc::rc;
 
-use crate::core::{actor::base::{Actor, ActorSignal, Addr, FornAddr, SignalHandle}, channels::promise::SyncPromiseResolver, executor::mail::MailId, shard::{
+use crate::core::{actor::base::{Actor, ActorSignal, Addr, FornAddr, SignalHandle}, channels::{bridge::{box_job, Bridge, Rx, Tx}, promise::SyncPromiseResolver}, executor::mail::MailId, shard::{
     error::ShardError,
     state::{ShardConfigMsg, ShardCtx, ShardId, ShardMapEntry, ShardMapTable, ShardRuntime},
 }, topology::TopologicalInformation};
@@ -68,7 +68,7 @@ pub fn signal_monorail(result: Result<(), Box<dyn Any + Send + 'static>>) {
             
         }
     } else {
-        submit_to(ShardId::new(0), |_| signal_monorail(result));
+        submit_to(ShardId::new(0), async || signal_monorail(result));
     }
 }
 
@@ -147,47 +147,46 @@ where
 
 // pub
 
-pub fn submit_task_to<F, FUT>(core: ShardId, task: F)
-where 
+// pub fn submit_task_to<F, FUT>(core: ShardId, task: F)
+// where 
+//     F: FnOnce() -> FUT + Send + 'static,
+//     FUT: Future<Output = ()> + 'static
+// {
+//     submit_to(core, move |runtime| {
+//         let task = task();
+
+//         // spawn_async_task(async move {
+//         //     use smol::future::FutureExt;
+
+
+//         // //    task.catch_unwind().await; 
+
+//         // });
+
+//         spawn_async_task(async move {
+//             match AssertUnwindSafe(task).catch_unwind().await {
+//                 Ok(_) => {},
+//                 Err(e) => signal_monorail(Err(e)),
+//             }
+//         }).detach();
+//     });
+// }
+
+pub fn submit_to<F, FUT>(core: ShardId, task: F)
+where
     F: FnOnce() -> FUT + Send + 'static,
     FUT: Future<Output = ()> + 'static
 {
-    submit_to(core, move |runtime| {
-        let task = task();
-
-        // spawn_async_task(async move {
-        //     use smol::future::FutureExt;
 
 
-        // //    task.catch_unwind().await; 
-
-        // });
-
-        spawn_async_task(async move {
-            match AssertUnwindSafe(task).catch_unwind().await {
-                Ok(_) => {},
-                Err(e) => signal_monorail(Err(e)),
-            }
-        }).detach();
-    });
-}
-
-pub fn submit_to<F>(core: ShardId, task: F)
-where
-    F: FnOnce(&mut ShardRuntime) + Send + 'static,
-{
-
+    let job = box_job(task);
 
     ROUTING_TABLE
         .with(|f: &UnsafeCell<Option<&'static ShardCtx>>| unsafe { &*f.get() }.unwrap())
         .table
         .table[core.as_usize()]
-    .queue
-    .send(Box::new(task))
-    .inspect_err(|e| {
-        println!("ERROR SENDING MSG");
-    })
-    .expect("Failed for cross core communicatin..");
+        
+        .fire_and_forget(job);
 }
 
 pub fn get_topology_info() -> &'static TopologicalInformation {
@@ -237,7 +236,7 @@ fn configure_shard_executor(
     rcvers: Vec<Receiver<Task>>,
     notifier: SyncPromiseResolver<()>,
 ) {
-    let mut runtime = Rc::new(UnsafeCell::new(ShardRuntime::new(core)));
+    // let mut runtime = Rc::new(UnsafeCell::new(ShardRuntime::new(core)));
     // let executor = LocalExecutor::new().leak();
 
     // println!("Entering...");
@@ -245,21 +244,27 @@ fn configure_shard_executor(
     smol::future::block_on(ctx.executor.run(async move {
 
 
-        for recvr in rcvers {
-            let rcvr = Box::leak(Box::new(recvr));
-            let runtime2 = runtime.clone();
+        for bridge in &ctx.table.table {
             ctx.executor.spawn(async move {
-                let runtime2 = unsafe { &mut *runtime2.get() };
-                loop {
-                    // println!("WAITING>..");
-                    let task = rcvr.recv_async().await.unwrap();
-                    // println!("GOT A TASK...");
-                    // task(runtime2);
-                    monorail_unwind_guard(|| task(runtime2));
-                }
+                bridge.run_bridge().await;
             }).detach();
-
         }
+
+        // for recvr in rcvers {
+        //     let rcvr = Box::leak(Box::new(recvr));
+        //     let runtime2 = runtime.clone();
+        //     ctx.executor.spawn(async move {
+        //         let runtime2 = unsafe { &mut *runtime2.get() };
+        //         loop {
+        //             // println!("WAITING>..");
+        //             let task = rcvr.recv_async().await.unwrap();
+        //             // println!("GOT A TASK...");
+        //             // task(runtime2);
+        //             monorail_unwind_guard(|| task(runtime2));
+        //         }
+        //     }).detach();
+
+        // }
 
 
         let _ = notifier.resolve(());
@@ -274,24 +279,86 @@ fn configure_shard(
     total_cores: usize,
     config_rx: Receiver<ShardConfigMsg>,
 ) -> Result<(ShardMapTable, Vec<Receiver<Task>>, SyncPromiseResolver<()>), ShardError> {
+
+
+    let mut producers = vec![];
+    for i in 0..total_cores {
+        producers.push(None);
+    }
+    let mut consumers = vec![];
+    for i in 0..total_cores {
+        consumers.push(None);
+    }
+
+    //   let mut producers_rx = vec![];
+    // for i in 0..total_cores {
+    //     producers_rx.push(None);
+    // }
+    // let mut consumers_rx = vec![];
+    // for i in 0..total_cores {
+    //     consumers_rx.push(None);
+    // }
+
+
     let mut shard_recievers = Vec::with_capacity(total_cores);
     let mut notifier = None;
     let table = ShardMapTable::initialize(total_cores, |rt| {
         loop {
             match config_rx.recv() {
                 Ok(msg) => match msg {
-                    ShardConfigMsg::ConfigureExternalShard { target_core, queue } => {
-                        rt[target_core.as_usize()] = Some(ShardMapEntry { queue });
+                    ShardConfigMsg::ConfigureExternalShard { target_core, consumer } => {
+                        // producers[target_core.as_usize()] = Some(from_receiver);
+
+                        producers[target_core.as_usize()] = Some(consumer);
+
+
+
+                        // producers_rx[]
+                        // consumers_tx[target_core.as_usize()] = Some(rx_consumer);
+                        // producers_rx[target_core.as_usize()] = Some(tx_producer);
                     }
-                    ShardConfigMsg::RequestEntry {
-                        // requester: _,
+                    ShardConfigMsg::StartConfiguration {
+                        requester,
                         queue,
                     } => {
-                        let (tx, rx) = flume::bounded(50);
-                        shard_recievers.push(rx);
-                        queue.resolve(tx);
+
+                        let (tx_producer, tx_consumer) = Bridge::create_queues::<Rx, Tx>();
+                        // let (rx_producer, rx_consumer) = Bridge::create_queues();
+
+                        // producers[requester.as_usize()] = Some(tx_producer);
+                        // consumers_rx[requester.as_usize()] = Some(rx_consumer);
+
+                        consumers[requester.as_usize()] = Some(tx_consumer);
+
+                        queue.resolve(tx_producer);
+
+                        // producers[requester.as_usize()] = Some(producer);
+                        // queue.resolve(consumer);
+                        // consumers[requester.as_usize()] = Some(consumer);
+                        // queue.
+
+                        // let (tx, rx) = flume::bounded(50);
+                        // shard_recievers.push(rx);
+                        // queue.resolve(tx);
                     }
                     ShardConfigMsg::FinalizeConfiguration(tx) => {
+
+                        // let tx = producers_rx.into_iter().map(Option::unwrap).zip(consumers.into_iter().map(Option::unwrap)).collect::<Vec<_>>();
+                        // let rx = producers.into_iter().map(Option::unwrap).zip(consumers_rx.into_iter().map(Option::unwrap)).collect::<Vec<_>>();
+
+
+                        let mut channels = producers.into_iter().map(Option::unwrap).zip(consumers.into_iter().map(Option::unwrap)).map(|(producer, consumer)| {
+                            Bridge::create(producer, consumer)
+                        }).collect::<Vec<_>>();
+                        
+                        // for i in 0..channels.len() {
+                        //     rt[i] = Some(channels[i]);
+                        // }
+
+                        for i in 0..channels.len() {
+                            rt[i] = Some(channels.remove(0));
+                        }
+
                         notifier = Some(tx);
                         // println!("Shard {core:?} was told to finalize.");
                         break;

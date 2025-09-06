@@ -26,20 +26,14 @@ pub trait CallRoutePolicy<M>: Actor
 //     // fnb 
 // }
 
-struct LocalRouterCtx<A>
-where
-    A: Actor,
-{
-    addr: FornAddr<A>,
-    local: usize,
-}
+
 
 pub struct RouterState<A>
 where
     A: Actor,
     Router<A>: Actor
 {
-    targets: Vec<LocalRouterCtx<A>>,
+    targets: Vec<FornAddr<A>>,
     last_shot: usize,
     arguments: RouterArguments<A>,
     _marker: PhantomData<A>,
@@ -97,7 +91,7 @@ where
 {
     type Output = Result<RouterResponse<<A as ActorCall<M>>::Output>, anyhow::Error>;
     async fn call<'a>(
-        this: super::base::SelfAddr<'a, Self>,
+        _: super::base::SelfAddr<'a, Self>,
         msg: M,
         state: &'a mut Self::State,
     ) -> Self::Output {
@@ -112,15 +106,21 @@ where
             return Err(anyhow!("Specified policy routed the message out of bounds."));
         }
         // println!("Targeting -> {target}");
+        // println!("Doing actual router work...");
         let reso = state.targets[policy]
-            .addr
+            // .addr
             .call(msg)
             .await
             .map(|f| RouterResponse {
                 message: f,
                 responder: policy,
             });
+        // println!("doing non rouer work(done ig)");
 
+        if reso.is_err() {
+            // println!("ROUTER DEATH");
+        }
+        
         reso
 
         // state.targets[0].addr.call(msg).await.map
@@ -165,7 +165,9 @@ where
             return Err(anyhow!("Target specified by routing policy is out of range."));
         }
 
-        state.targets[target].addr.send(message).await?;
+        state.targets[target].send(message).await.inspect_err(|e| {
+            // println!("DEAD: {e:?}");
+        })?;
 
 
         Ok(())
@@ -184,17 +186,14 @@ where
     ) -> anyhow::Result<()> {
         for i in 0..get_topology_info().cores {
             // println!("Starting actor on {i}");
-            let args_copy = state.arguments.arguments.clone();
+            // let args_copy = state.arguments.arguments.clone();
             let forn = this
                 .spawn_linked_foreign::<A>(ShardId::new(i), (state.arguments.transformer)(&state.arguments, i))
                 .await?;
 
                 // println!("Forn: {:?}", forn.signal);
 
-            state.targets.push(LocalRouterCtx {
-                addr: forn,
-                local: i,
-            });
+            state.targets.push(forn);
         }
 
         Ok(())
@@ -212,19 +211,22 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use futures::channel::oneshot;
+    use smol::Timer;
 
     use crate::core::{
         actor::{
             base::{Actor, ActorCall},
             routing::{CallRoutePolicy, Router, RouterArguments, RouterSpawnPolicy, RoutingPolicy},
         },
-        shard::{shard::{shard_id, signal_monorail, spawn_actor, spawn_async_task, submit_task_to}, state::ShardId},
+        shard::{shard::{shard_id, signal_monorail, spawn_actor, spawn_async_task, submit_to}, state::ShardId},
         topology::{MonorailConfiguration, MonorailTopology},
     };
 
     #[test]
-    pub fn test_router() {
+    pub fn test_router_d() {
         pub struct BasicAdder;
 
         impl Actor for BasicAdder {
@@ -244,6 +246,13 @@ mod tests {
             fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 Ok(arguments)
             }
+            async fn post_start(
+                    this: crate::core::actor::base::SelfAddr<'_, Self>,
+                    state: &mut Self::State,
+                ) -> anyhow::Result<()> {
+                // Timer::after(Duration::from_secs(2)).await;
+                Ok(())
+            }
         }
 
         impl ActorCall<usize> for BasicAdder {
@@ -253,6 +262,7 @@ mod tests {
                 msg: usize,
                 state: &'a mut Self::State,
             ) -> Self::Output {
+                // println!("RECIV");
                 msg + 1
             }
         }
@@ -280,14 +290,21 @@ mod tests {
                         transformer: |a, b| a.arguments
                     })
                     .unwrap();
+                // Timer::after(Duration::from_millis(250)).await;
+
+
+                    println!("hello... (R)");
 
                     let result = forn
                         .call(5)
                         .await
                         .unwrap()
                         .expect("Failed to process the routed message.");
+                
                     assert_eq!(result.responder, 0);
                     assert_eq!(result.message, 6);
+
+                    println!("Hello 2...");
 
 
                     let result = forn
@@ -297,6 +314,8 @@ mod tests {
                         .expect("Failed to process the routed message.");
                     assert_eq!(result.responder, 1);
                     assert_eq!(result.message, 6);
+
+                    println!("Hello 3....");
 
                     signal_monorail(Ok(()));
 
@@ -355,7 +374,7 @@ mod tests {
                 .with_core_override(6)
                 .build(),
             |init| {
-                submit_task_to(ShardId::new(0), || async move {
+                submit_to(ShardId::new(0), || async move {
                     let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
@@ -363,6 +382,8 @@ mod tests {
                         transformer: |a, _| a.arguments
                     })
                     .unwrap();
+                // Timer::after(Duration::from_millis(250)).await;
+
 
                     let result = forn
                         .call(5)
@@ -394,7 +415,7 @@ mod tests {
     
 
     #[test]
-    pub fn test_message_routing_function() {
+    pub fn test_router_message_routing_function() {
         pub struct BasicAdder;
 
         impl Actor for BasicAdder {
@@ -424,7 +445,7 @@ mod tests {
                 .with_core_override(6)
                 .build(),
             |init| {
-                submit_task_to(ShardId::new(0), || async move {
+                submit_to(ShardId::new(0), || async move {
                     let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
@@ -434,6 +455,9 @@ mod tests {
                         transformer: |a, _| a.arguments
                     })
                     .unwrap();
+                    // Timer::after(Duration::from_millis(250)).await;
+
+                    // println!("Flag A");
 
                     let (tx, rx) = oneshot::channel();
                     local.send((3, tx)).await.unwrap();
@@ -441,12 +465,15 @@ mod tests {
                     assert_eq!(shard.as_usize(), 3);
                     assert_eq!(result, 4);
 
+                    // println!("Flag B");
+
                     let (tx, rx) = oneshot::channel();
                     local.send((4, tx)).await.unwrap();
                     let (shard, result) = rx.await.unwrap();
                     assert_eq!(shard.as_usize(), 4);
                     assert_eq!(result, 5);
 
+                    // println!("Flag C");
                  
                     signal_monorail(Ok(()));
 

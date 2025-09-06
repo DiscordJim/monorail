@@ -56,6 +56,7 @@ impl<T> PromiseResolver<T> {
         self.internal.is_ready.get() == PromiseState::Closed
     }
     pub fn resolve(self, value: T) -> Result<(), (T, PromiseError)> {
+        println!("Resolving a promise...");
         match self.internal.is_ready.get() {
             PromiseState::Closed => {
                 Err((value, PromiseError::PromiseClosed))

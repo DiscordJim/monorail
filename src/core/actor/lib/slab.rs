@@ -89,7 +89,7 @@ where
         ""
     }
     fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
-        println!("Received init number: {arguments}");
+        // println!("Received init number: {arguments}");
         Ok((arguments, Slab::new()))
     }
     async fn handle(
@@ -124,19 +124,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{actor::lib::slab::ShardedSlab, shard::{shard::{signal_monorail, submit_task_to}, state::ShardId}, topology::{MonorailConfiguration, MonorailTopology}};
+    use std::time::Duration;
+
+    use smol::Timer;
+
+    use crate::core::{actor::lib::slab::ShardedSlab, shard::{shard::{signal_monorail, submit_to}, state::ShardId}, topology::{MonorailConfiguration, MonorailTopology}};
 
 
     #[test]
-    pub fn test_distributed_slab() {
+    pub fn test_router_distributed_slab() {
 
         MonorailTopology::setup(
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
             |_| {
-                submit_task_to(ShardId::new(0), async move || {
+                submit_to(ShardId::new(0), async move || {
                     let map = ShardedSlab::<&'static str>::new().unwrap();
+
+                    // Timer::after(Duration::from_millis(250)).await;
 
                     let what = map.insert("what").await.unwrap();
                     assert_eq!(map.get(what).await.unwrap(), Some("what"));

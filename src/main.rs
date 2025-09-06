@@ -370,10 +370,10 @@ fn main() {
 
         let mut listener = TcpListener::bind(exec.io_uring(), "0.0.0.0:0").await.unwrap();
         let ad = listener.local_addr().unwrap();
-        println!("Hello {:?}", ad);
+        // println!("Hello {:?}", ad);
 
         let lis = listener.accept().await.unwrap();
-        println!("HELLO");
+        // println!("HELLO");
         // let mut buffer = vec![0u8; 512];
         // let (r, buffer) = 
 
@@ -432,10 +432,10 @@ fn main() {
 
         // EBADF
 
-        println!("advancing...");
-        println!("probe bind: {}", Probe::new().is_supported(Bind::CODE));
-        println!("probe read: {}", Probe::new().is_supported(Read::CODE));
-        println!("Supports IORING BIND: {}", driver.supports_bind());
+        // println!("advancing...");
+        // println!("probe bind: {}", Probe::new().is_supported(Bind::CODE));
+        // println!("probe read: {}", Probe::new().is_supported(Read::CODE));
+        // println!("Supports IORING BIND: {}", driver.supports_bind());
 
         // EFAULT
         // EINVAL
@@ -453,10 +453,10 @@ fn main() {
         loop {
             let time = SystemTime::now();
 
-            println!("initiating...");
+            // println!("initiating...");
             timeout(&driver, Duration::from_millis(10)).await.unwrap();
             let elapsed = time.elapsed().unwrap();
-            println!("Elapsed: {:?}", elapsed);
+            // println!("Elapsed: {:?}", elapsed);
         }
         // let socket = socket(&driver, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP).await.unwrap();
         // println!("Socket: {socket}");

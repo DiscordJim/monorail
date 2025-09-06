@@ -4,3 +4,4 @@ pub use flume::Sender as Sender;
 pub use flume::Receiver as Receiver;
 
 pub mod promise;
+pub mod bridge;

@@ -3,13 +3,13 @@ use std::{any::Any, panic::AssertUnwindSafe};
 use flume::Sender;
 
 use crate::core::{
-    channels::promise::SyncPromise,
+    channels::{bridge::{box_job, BridgedTask}, promise::SyncPromise},
     shard::{
         error::ShardError,
         shard::{setup_shard, signal_monorail, MONITOR},
         state::{ShardConfigMsg, ShardId, ShardRuntime},
     },
-    task::Task,
+    task::{self, Task},
 };
 
 pub struct MonorailTopology {}
@@ -70,22 +70,30 @@ fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError
         for y in 0..core_count {
             let (tx, rx) = SyncPromise::new();
             configurations[y]
-                .send(ShardConfigMsg::RequestEntry {
-                    // requester: ShardId::new(x),
+                .send(ShardConfigMsg::StartConfiguration {
+                    requester: ShardId::new(x),
                     queue: rx,
+
                 })
                 .map_err(|_| TopologyError::ShardClosedPrematurely)?;
-            let queue = tx
+            let mut queue = tx
                 .wait()
                 .map_err(|_| TopologyError::ShardClosedPrematurely)?;
             if x == 0 && y == 0 {
-                seed_queue = Some(queue.clone());
+                let (seed_tx, seed_rx) = flume::unbounded();
+                let _ = queue.send(BridgedTask::FireAndForget(box_job(async move || {
+                    let task: Box<dyn FnOnce(&mut ShardRuntime) + Send + 'static> = seed_rx.recv_async().await.unwrap();
+                    
+                    task(&mut ShardRuntime::new(ShardId::new(0)));
+                })));
+                seed_queue = Some(seed_tx);
             }
 
             configurations[x]
                 .send(ShardConfigMsg::ConfigureExternalShard {
                     target_core: ShardId::new(y),
-                    queue,
+                    consumer: queue
+                    // queue,
                 })
                 .map_err(|_| TopologyError::ShardClosedPrematurely)?;
         }
@@ -161,7 +169,7 @@ mod tests {
     use crate::core::{
         channels::promise::{SyncPromise, SyncPromiseResolver},
         shard::{
-            shard::{signal_monorail, submit_to},
+            shard::{shard_id, signal_monorail, submit_to},
             state::{ShardId, ShardRuntime},
         },
         topology::{MonorailConfiguration, MonorailTopology},
@@ -187,11 +195,12 @@ mod tests {
         static MERRY_GO_ROUND: LazyLock<Mutex<Vec<usize>>> =
             LazyLock::new(|| Mutex::new(Vec::new()));
 
-        fn jmp(runtime: &mut ShardRuntime, resolver: SyncPromiseResolver<()>) {
-            MERRY_GO_ROUND.lock().unwrap().push(runtime.id.as_usize());
-            if runtime.id.as_usize() < 5 {
-                submit_to(ShardId::new(runtime.id.as_usize() + 1), move |runtime| {
-                    jmp(runtime, resolver)
+        fn jmp(resolver: SyncPromiseResolver<()>) {
+            MERRY_GO_ROUND.lock().unwrap().push(shard_id().as_usize());
+            // println!("Broadcasting from {:?}", shard_id());
+            if shard_id().as_usize() < 5 {
+                submit_to(ShardId::new(shard_id().as_usize() + 1), async || {
+                    jmp(resolver)
                 });
             } else {
                 resolver.resolve(());
@@ -204,7 +213,7 @@ mod tests {
                 .build(),
             move |d| {
                 let (rx, tx) = SyncPromise::new();
-                jmp(d, tx);
+                jmp(tx);
                 rx.wait().unwrap();
                 signal_monorail(Ok(()));
                 // ControlFlow::Break(())
