@@ -1,24 +1,19 @@
 use std::{
-    collections::VecDeque, future::Future, marker::PhantomData, ops::{Add, Deref}, pin::Pin, rc::Rc
+    collections::VecDeque, future::Future, marker::PhantomData, ops::{Add, Deref}, pin::Pin, ptr::NonNull, rc::Rc
 };
 
 use anyhow::{anyhow, Result};
 use asyncnal::{EventSetter, LocalEvent};
 use flume::{Receiver, Sender};
+use futures::channel::oneshot;
 use smol::{future::race, Task};
 
-use crate::core::executor::{
-    helper::{select2, Select2Result},
-    scheduler::Executor,
-};
+use crate::core::{actor::futures::BoxedCall, channels::promise::Promise, executor::{
+    helper::{select2, Select2Result}, mail::MailId, scheduler::Executor
+}, shard::{shard::{self, get_actor_addr, signal_actor_mailbox, spawn_async_task, submit_to}, state::{ShardId, ShardRuntime}}};
 
 pub trait ActorCall<M>: Actor {
     type Output;
-
-    // The future returned by `call`, parameterized by the borrow of `state` and `SelfAddr`.
-    // type Fut<'a>: Future<Output = Self::Output> + 'a
-    // where
-    //     Self: 'a;
 
     fn call<'a>(
         this: SelfAddr<'a, Self>,
@@ -32,9 +27,12 @@ struct SubTaskHandle {
     handle: SignalHandle,
 }
 
+
+
 struct InternalActorRunCtx {
     executor: &'static Executor<'static>,
     tasks: Vec<SubTaskHandle>,
+    foreigns: Vec<FornSignalHandle>
 }
 
 pub struct SelfAddr<'a, A>
@@ -50,11 +48,39 @@ impl<'a, A> SelfAddr<'a, A>
 where
     A: Actor,
 {
+    pub async fn spawn_linked_foreign<B>(&mut self, core: ShardId, arguments: B::Arguments) -> Result<FornAddr<B>>
+    where 
+        B: Actor,
+        B::Message: Send + 'static,
+        B::Arguments: Send + 'static
+    {
+
+        let (tx, rx) = oneshot::channel();
+        submit_to(core, |_| {
+            match shard::spawn_actor(arguments) {
+                Ok((actor, _)) => {
+                    let _ = tx.send(Ok(actor));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+            // let (foreign, local) = shard::spawn_actor(arguments);
+        });
+        
+        let handler = rx.await??;
+
+        self.internal.foreigns.push(handler.clone().signal);
+
+
+        Ok(handler)
+
+    }
     pub async fn spawn_linked<B>(&mut self, arguments: B::Arguments) -> Result<()>
     where
         B: Actor,
     {
-        let (actor, handle) = spawn_actor::<B>(self.internal.executor, arguments).await?;
+        let (actor, handle) = spawn_actor::<B>(self.internal.executor, arguments)?;
         self.internal.tasks.push(SubTaskHandle {
             handle: actor.raw.signal_handle,
             task: handle,
@@ -114,9 +140,19 @@ pub enum ActorSignal {
 }
 
 #[derive(Clone)]
-struct SignalHandle {
+pub(crate) struct SignalHandle {
     signal_channel: Sender<ActorSignal>,
     kill_signal: Rc<LocalEvent>,
+}
+
+impl SignalHandle {
+    pub fn stop(&self) -> Result<()> {
+        self.signal_channel.send(ActorSignal::Stop).map_err(|_| anyhow::anyhow!("Failed to send signal."))?;
+        Ok(())
+    }
+    pub fn kill(&self) {
+        self.kill_signal.set_one();
+    }
 }
 
 // #[derive(Clone)]
@@ -157,9 +193,6 @@ where
     }
 }
 
-// struct InternalActorRunCtx {
-//     subtasks: Vec<>
-// }
 
 #[allow(unused_variables)]
 /// Actors are the basic unit of concurrency in monorail. Please note that
@@ -172,7 +205,7 @@ pub trait Actor: Sized + 'static {
     /// The actor must define a unique name. This is for trace monitoring.
     fn name() -> &'static str;
 
-    fn pre_start(arguments: Self::Arguments) -> impl Future<Output = Result<Self::State>>;
+    fn pre_start(arguments: Self::Arguments) -> Result<Self::State>;
 
     fn post_start(
         this: SelfAddr<'_, Self>,
@@ -195,7 +228,8 @@ pub trait Actor: Sized + 'static {
     }
 }
 
-// #[derive(Clone)]
+
+
 pub struct Addr<T>
 where
     T: Actor,
@@ -208,6 +242,9 @@ impl<T> Addr<T>
 where
     T: Actor,
 {
+    pub(crate) fn downgrade(self) -> SignalHandle {
+        self.raw.signal_handle
+    }
     pub async fn send(&self, message: T::Message) -> Result<(), T::Message> {
         if let Err(e) = self.raw.msg_channel.send_async(NormalActorMessage::Message(message)).await {
             // retu
@@ -235,27 +272,11 @@ where
     }
 }
 
-type BoxedCall<A> =
-    Box<
-        dyn for<'a> FnOnce(
-            SelfAddr<'a, A>,
-            &'a mut <A as Actor>::State,
-        ) -> Pin<Box<dyn Future<Output = ()> + 'a>>
-        + 'static
-    >;
 
-fn box_call<A, F, C>(c: C) -> BoxedCall<A>
-where
-    A: Actor,
-    // The closure may borrow `state` for some `'a`
-    for<'a> C: FnOnce(SelfAddr<'a, A>, &'a mut A::State) -> F + 'static,
-    for<'a> F: Future<Output = ()> + 'a,
-{
-    Box::new(move |this, state| {
-        // Automatically box the returned future
-        Box::pin(c(this, state))
-    })
-}
+
+
+
+
 impl<T> Addr<T>
 where
     T: Actor,
@@ -265,15 +286,11 @@ where
         T: ActorCall<P>,
         P: 'static,
     {
-        let (tx, rx) = futures::channel::oneshot::channel::<<T as ActorCall<P>>::Output>();
-
-        // NOTE: no explicit arg types -> allows HRTB coercion.
+        let (tx, rx) = Promise::new();
         let boxed: BoxedCall<T> = Box::new(move |this, state| {
-            // 1) build the actor-local future with lifetime `'a`
             let fut = <T as ActorCall<P>>::call(this, param, state);
-            // 2) box a tiny wrapper that awaits it
             Box::pin(async move {
-                let _ = tx.send(fut.await);
+                let _ = rx.resolve(fut.await);
             })
         });
 
@@ -283,18 +300,7 @@ where
             .await
             .map_err(|_| anyhow!("Failed to send."))?;
 
-        println!("Injected into channel.");
-
-        rx.await.map_err(|_| anyhow!("Call canceled."))
-
-        // self.raw
-        //     .call_channel
-        //     .send_async(boxed)
-        //     .await
-        //     .map_err(|_| CallError::MailboxClosed)?;
-
-        // rx.await.map_err(|_| CallError::Canceled)
-        // Err(anyhow!("y"))
+        tx.await.map_err(|_| anyhow!("Call canceled."))
     }
 }
 
@@ -312,8 +318,6 @@ where
 
 pub enum ActorMessage<T: Actor> {
     Signal(ActorSignal),
-    // Call(Box<dyn FnOnce(SelfAddr<T>, &mut T::State) -> dyn Future<Output = ()>>),
-    // Call(Box<dyn ActorCall>),
     Call(BoxedCall<T>),
     Message(T::Message),
 }
@@ -328,7 +332,6 @@ where
 
 async fn actor_action_loop<A>(
     addr: &Addr<A>,
-    death: &mut Option<ActorSignal>,
     ctx: &mut InternalActorRunCtx,
     msg_rx: &Receiver<NormalActorMessage<A>>,
     sig_rx: &Receiver<ActorSignal>,
@@ -370,7 +373,7 @@ where
     // Ok(())
 }
 
-pub async fn spawn_actor<A>(
+pub fn spawn_actor<A>(
     executor: &'static Executor<'static>,
     arguments: A::Arguments,
 ) -> anyhow::Result<(Addr<A>, Task<()>)>
@@ -379,10 +382,11 @@ where
 {
     let (msg_tx, msg_rx) = flume::unbounded();
     let (sig_tx, sig_rx) = flume::unbounded();
-    let mut state = A::pre_start(arguments).await?;
+    let mut state = A::pre_start(arguments)?;
     let mut context = InternalActorRunCtx {
         executor,
         tasks: vec![],
+        foreigns: vec![]
     };
 
     let addr = Addr {
@@ -409,7 +413,7 @@ where
             )
             .await;
             let death_reason = smol::future::race(
-                actor_action_loop(&addr, &mut None, &mut context, &msg_rx, &sig_rx, &mut state),
+                actor_action_loop(&addr, &mut context, &msg_rx, &sig_rx, &mut state),
                 async {
                     addr.raw.signal_handle.kill_signal.wait().await;
                     // println!("triggered???");
@@ -432,6 +436,9 @@ where
                     for task in &context.tasks {
                         task.handle.kill_signal.set_one();
                     }
+                    for task in &context.foreigns {
+                        let _ = task.kill().await;
+                    }
                 }
                 ActorSignal::Stop => {
                     for task in &context.tasks {
@@ -440,6 +447,9 @@ where
                             .signal_channel
                             .send_async(ActorSignal::Stop)
                             .await;
+                    }
+                    for task in &context.foreigns {
+                        let _ = task.stop().await;
                     }
                 }
             }
@@ -452,6 +462,223 @@ where
     Ok((addr, task))
 }
 
+
+// Foreign Addresses -- Allow us to 
+// send to an actor from another thread.
+pub struct FornAddr<A>
+where 
+    A: Actor
+{
+    pub(crate) signal: FornSignalHandle,
+    pub(crate) _marker: PhantomData<A>
+}
+
+pub struct FornSignalHandle {
+    pub(crate) shard: ShardId,
+    pub(crate) mail: MailId
+}
+
+
+impl<A> Clone for FornAddr<A>
+where 
+    A: Actor
+{
+    fn clone(&self) -> Self {
+        Self {
+            signal: FornSignalHandle {
+                mail: self.signal.mail,
+                shard: self.signal.shard
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+
+
+impl FornSignalHandle {
+    pub async fn stop(&self) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+
+        let id = self.mail;
+        submit_to(self.shard, move |_| {
+            match signal_actor_mailbox(id, ActorSignal::Stop) {
+                Ok(v) => {
+                    let _ = tx.send(Ok(v));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        });
+
+        Ok(rx.await??)
+    }
+
+    pub async fn kill(&self) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+
+        let id = self.mail;
+        submit_to(self.shard, move |_| {
+            match signal_actor_mailbox(id, ActorSignal::Kill) {
+                Ok(v) => {
+                    let _ = tx.send(Ok(v));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        });
+
+        Ok(rx.await??)
+    }
+}
+
+unsafe impl<A> Send for FornAddr<A>
+where 
+    A: Actor {}
+
+impl<A> FornAddr<A>
+where 
+    A: Actor
+{
+
+    pub async fn stop(&self) -> anyhow::Result<()>
+    {
+        // let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
+        
+        // let addr2 = self.clone();
+        // submit_to(self.shard, |_| {
+        //     let Some(addr) = get_actor_addr(addr2) else {
+        //         let _ = tx.send(Err((anyhow!("Failed to actually find the actor on the other core."))));
+        //         return;
+        //     };
+
+        //     spawn_async_task(async move {
+        //          match addr.stop().await {
+        //             Ok(v) => {
+        //                 let _ = tx.send(Ok(v));
+        //             }
+        //             Err(e) => {
+        //                 let _ = tx.send(Err((anyhow!("Failed to send."))));
+        //             }
+        //         }
+        //     }).detach();
+        // });
+
+        // match rx.await {
+        //     Ok(a) => {
+        //         return a;
+        //     }
+        //     Err(e) => return Err(anyhow!("Failed"))
+        // }
+        // Ok(())
+
+        self.signal.stop().await
+        // Ok(rx.await??)
+        // Ok(rx.await??)
+    }
+
+    // async fn access_actor_remotely(&self, F)
+    pub async fn kill(&self) -> anyhow::Result<()>
+    // where
+        // A::Message: Send + 'static
+    {
+        // let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
+        
+        // let addr2 = self.clone();
+        // submit_to(self.shard, |_| {
+        //     let Some(addr) = get_actor_addr(addr2) else {
+        //         // let _ = tx.send(Err((anyhow!("Failed to actually find the actor on the other core."))));
+        //         return;
+        //     };
+        //     addr.kill();
+        // });
+        self.signal.kill().await
+    }
+    pub async fn send(&self, message: A::Message) -> anyhow::Result<()>
+    where
+        A::Message: Send + 'static
+    {
+        let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
+        
+        let addr2 = self.clone();
+        submit_to(self.signal.shard, |_| {
+            let Some(addr) = get_actor_addr(addr2) else {
+                let _ = tx.send(Err((anyhow!("Failed to actually find the actor on the other core."))));
+                return;
+            };
+
+            spawn_async_task(async move {
+                 match addr.send(message).await {
+                    Ok(v) => {
+                        let _ = tx.send(Ok(v));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err((anyhow!("Failed to send."))));
+                    }
+                }
+            }).detach();
+        });
+
+        match rx.await {
+            Ok(a) => {
+                return a;
+            }
+            Err(e) => return Err(anyhow!("Failed"))
+        }
+        Ok(())
+
+        // Ok(rx.await??)
+        // Ok(rx.await??)
+    }
+    pub async fn call<P>(&self, param: P) -> Result<<A as ActorCall<P>>::Output, anyhow::Error>
+    where
+        A: ActorCall<P>,
+        A::Output: Send,
+        P: Send + 'static,
+        A::Message: Send + 'static
+    {
+
+        let addr2 = self.clone();
+
+        let (tx, rx) = oneshot::channel();
+
+
+        submit_to(self.signal.shard, |_| {
+            // spawn_async_task(future)
+            let Some(addr) = get_actor_addr(addr2) else {
+                let _ = tx.send(Err(anyhow!("Failed to actually find the actor on the other core.")));
+                return;
+            };
+
+            spawn_async_task(async move {
+                 match addr.call(param).await {
+                    Ok(v) => {
+                        let _ = tx.send(Ok(v));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            }).detach();
+
+           
+
+            // let output = addr.call(param).await
+
+        });
+
+
+
+     
+
+        Ok(rx.await??)
+
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc, time::Duration};
@@ -461,12 +688,12 @@ mod tests {
 
     use crate::core::{
         actor::base::{spawn_actor, Actor, ActorCall},
-        executor::scheduler::Executor,
+        executor::scheduler::Executor, shard::state::ShardId,
     };
 
     #[test]
     pub fn test_actor_basic() {
-        let executor = Executor::new().leak();
+        let executor = Executor::new(ShardId::new(0)).leak();
 
         /// Define an actor that adds numbers to a base.
         struct BasicActor;
@@ -478,7 +705,7 @@ mod tests {
             fn name() -> &'static str {
                 "BasicActor"
             }
-            async fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 Ok(arguments)
             }
             async fn handle(
@@ -495,7 +722,7 @@ mod tests {
         }
 
         smol::future::block_on(executor.run(async {
-            let (actor, handle) = spawn_actor::<BasicActor>(executor, 5).await?;
+            let (actor, handle) = spawn_actor::<BasicActor>(executor, 5)?;
 
             let (tx, rx) = oneshot::channel();
             actor.send((10, tx)).await.unwrap();
@@ -521,7 +748,7 @@ mod tests {
 
     #[test]
     pub fn test_actor_kill() {
-        let executor = Executor::new().leak();
+        let executor = Executor::new(ShardId::new(0)).leak();
 
         struct DeathActor;
 
@@ -532,7 +759,7 @@ mod tests {
             fn name() -> &'static str {
                 "DeathActor"
             }
-            async fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 Ok(arguments)
             }
             async fn handle(
@@ -545,7 +772,7 @@ mod tests {
         }
 
         smol::future::block_on(executor.run(async {
-            let (actor, handle) = spawn_actor::<DeathActor>(executor, ()).await?;
+            let (actor, handle) = spawn_actor::<DeathActor>(executor, ())?;
 
             actor.kill();
 
@@ -560,7 +787,7 @@ mod tests {
     pub fn test_actor_children_stop() {
         let holder = Rc::new(RefCell::new(Vec::new()));
 
-        let executor = Executor::new().leak();
+        let executor = Executor::new(ShardId::new(0)).leak();
 
         // let mut collector = vec![];
         struct ChildActor;
@@ -572,7 +799,7 @@ mod tests {
             fn name() -> &'static str {
                 "ChildActor"
             }
-            async fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 Ok(arguments)
             }
             async fn post_start(
@@ -607,7 +834,7 @@ mod tests {
         let holder2 = holder.clone();
 
         smol::future::block_on(executor.run(async move {
-            let (actor, handle) = spawn_actor::<ChildActor>(executor, (0, holder.clone())).await?;
+            let (actor, handle) = spawn_actor::<ChildActor>(executor, (0, holder.clone()))?;
 
             actor.stop().await?;
 
@@ -629,7 +856,7 @@ mod tests {
     pub fn test_actor_children_kill() {
         let holder = Rc::new(RefCell::new(Vec::new()));
 
-        let executor = Executor::new().leak();
+        let executor = Executor::new(ShardId::new(0)).leak();
 
         // let mut collector = vec![];
         struct ChildActor;
@@ -641,7 +868,7 @@ mod tests {
             fn name() -> &'static str {
                 "ChildActor"
             }
-            async fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 Ok(arguments)
             }
             async fn post_start(
@@ -676,7 +903,7 @@ mod tests {
         let holder2 = holder.clone();
 
         smol::future::block_on(executor.run(async move {
-            let (actor, handle) = spawn_actor::<ChildActor>(executor, (0, holder.clone())).await?;
+            let (actor, handle) = spawn_actor::<ChildActor>(executor, (0, holder.clone()))?;
 
             actor.kill();
 
@@ -707,7 +934,7 @@ mod tests {
                 ""
             }
 
-            async fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 // println!("pre starting..");
                 Ok(Some(arguments))
             }
@@ -731,10 +958,10 @@ mod tests {
             }
         }
 
-        let executor = Executor::new().leak();
+        let executor = Executor::new(ShardId::new(0)).leak();
         smol::future::block_on(executor.run(async {
             let (tx, rx) = oneshot::channel();
-            let (actor, handle) = spawn_actor::<BasicIntervalActor>(executor, tx).await?;
+            let (actor, handle) = spawn_actor::<BasicIntervalActor>(executor, tx)?;
 
             // executor.sleep(Duration::from_millis(1)).await;\
             assert_eq!(rx.await?, 5);
@@ -769,7 +996,7 @@ mod tests {
             fn name() -> &'static str {
                 ""
             }
-            async fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 Ok(arguments.clone())
             }
             async fn post_start(
@@ -787,11 +1014,11 @@ mod tests {
             }
         }
 
-        let executor = Executor::new().leak();
+        let executor = Executor::new(ShardId::new(0)).leak();
         smol::future::block_on(executor.run(async {
             let (tx, rx) = flume::unbounded();
             let (actor, handle) =
-                spawn_actor::<IntervalCancelActor>(executor, tx.clone()).await?;
+                spawn_actor::<IntervalCancelActor>(executor, tx.clone())?;
 
 
             assert_eq!(rx.recv_async().await?, 4);
@@ -820,7 +1047,7 @@ mod tests {
             fn name() -> &'static str {
                 ""
             }
-            async fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
                 Ok(())
             }
         }
@@ -847,10 +1074,10 @@ mod tests {
             }
         }
 
-        let executor = Executor::new().leak();
+        let executor = Executor::new(ShardId::new(0)).leak();
         smol::future::block_on(executor.run(async {
 
-            let (actor, handle) = spawn_actor::<BasicActor>(executor, ()).await?;
+            let (actor, handle) = spawn_actor::<BasicActor>(executor, ())?;
             
             let hi = actor.call(3).await?;
             assert_eq!(hi, 4);

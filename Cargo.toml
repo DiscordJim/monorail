@@ -19,6 +19,7 @@ num_cpus = "1.17.0"
 pin-project = "1.1.10"
 slab = "0.4.11"
 smol = "2.0.2"
+static-rc = "0.7.0"
 thiserror = "2.0.16"
 
 [dev-dependencies]

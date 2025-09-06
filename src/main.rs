@@ -24,12 +24,10 @@ use smol::{
 };
 
 use crate::core::{
-    executor::scheduler::Executor,
-    io::{net::{TcpListener, TcpStream}, ring::{
+    executor::scheduler::Executor, io::{net::{TcpListener, TcpStream}, ring::{
         accept, bind, close, connect, install_timeout, ipv4_to_libc, listen, openat, read, socket,
         timeout, write, IoRingDriver,
-    }},
-    topology::MonorailTopology,
+    }}, shard::state::ShardId, topology::MonorailTopology
 };
 
 pub mod core;
@@ -315,7 +313,7 @@ fn main() {
     //     sched_setaffinity(pid, cpusetsize, cpuset)
     // }
 
-    let exec = Executor::new();
+    let exec = Executor::new(ShardId::new(0));
 
     // let mut driver = IoRingDriver::new(512).unwrap();
 

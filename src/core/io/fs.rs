@@ -125,7 +125,7 @@ mod tests {
         io::{
             fs::{File, OpenOptions},
             ring::{openat, IoRingDriver}, FromRing,
-        },
+        }, shard::state::ShardId,
     };
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
         tfile.write_all("hello".as_bytes())?;
         
 
-        let executor = Executor::new();
+        let executor = Executor::new(ShardId::new(0));
 
         smol::future::block_on(executor.run(async {
             let file = File::open(&executor.io_uring(), tfile.path()).await.unwrap();
@@ -153,7 +153,7 @@ mod tests {
         // tfile.write_all("hello".as_bytes())?;
         
 
-        let executor = Executor::new();
+        let executor = Executor::new(ShardId::new(0));
 
         smol::future::block_on(executor.run(async {
             let file = executor.open_options()

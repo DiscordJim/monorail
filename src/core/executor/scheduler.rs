@@ -10,10 +10,10 @@ use std::{
 };
 
 use crate::core::{
-    executor::backoff::{AdaptiveBackoff, BackoffResult},
-    io::{fs::OpenOptions, ring::{install_polladd_multi, install_timeout, timeout, Claim, IoRingDriver}, FromRing},
+    actor::base::{Actor, ActorSignal, Addr, FornAddr}, executor::{backoff::{AdaptiveBackoff, BackoffResult}, mail::{MailId, ShardActorOffice}}, io::{fs::OpenOptions, ring::{install_polladd_multi, install_timeout, timeout, Claim, IoRingDriver}, FromRing}, shard::state::ShardId
 };
 use async_task::{Builder, Runnable};
+use futures::{executor::LocalPool, task::{LocalSpawnExt, SpawnExt}};
 use io_uring::{squeue::PushError, types::Timespec};
 use lfqueue::UnboundedQueue;
 use nix::sys::eventfd::{EfdFlags, EventFd};
@@ -35,6 +35,8 @@ impl<'a> Executor<'a> {
 }
 
 struct ExecutorState {
+    id: ShardId,
+    office: RefCell<ShardActorOffice>,
     queue: RefCell<VecDeque<Runnable>>,
     // fast_queue: Bo
     mt_queue: UnboundedQueue<Runnable>,
@@ -56,7 +58,7 @@ impl<'a> Drop for ExecutorState {
 }
 
 impl<'a> Executor<'a> {
-    pub fn new() -> Self {
+    pub fn new(core: ShardId) -> Self {
         let event_fd = Box::into_raw(Box::new(
             EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
                 .unwrap(),
@@ -64,6 +66,8 @@ impl<'a> Executor<'a> {
 
         let obj = Self {
             state: ExecutorState {
+                id: ShardId::new(0),
+                office: ShardActorOffice::new().into(),
                 queue: RefCell::default(),
                 mt_queue: UnboundedQueue::new(),
                 // token: GhostToken::new(|token| token),
@@ -85,10 +89,39 @@ impl<'a> Executor<'a> {
         &self.state.ring
     }
 
-    pub fn spawn<T: 'a>(&'a self, future: impl Future<Output = T> + 'a) -> Task<T> {
+    // pub(crate) fn with_signal_handler<F>(&self, addr: &FornAddr<A>, ) {
+
+    //     self.state.office.borrow().
+
+    // }
+
+
+    pub(crate) fn signal_mailbox(&self, addr: MailId, signal: ActorSignal) -> anyhow::Result<()> {
+        self.state.office.borrow().signal_address(addr, signal)
+    }
+
+    pub(crate) fn lookup_actor<A>(&self, addr: FornAddr<A>) -> Option<Addr<A>>
+    where 
+        A: Actor
+    {
+        self.state.office.borrow().lookup_address::<A>(addr.signal.mail).cloned()
+
+    }
+
+    pub fn spawn_actor<A>(&'static self, arguments: A::Arguments) -> anyhow::Result<(FornAddr<A>, Addr<A>)>
+    where 
+        A: Actor + 'static,
+        // A::Arguments: 'a
+    {
+        self.state.office.borrow_mut().spawn_actor(self.state.id, self, arguments)
+    }
+    
+
+    pub(crate) fn spawn<T: 'a>(&'a self, future: impl Future<Output = T> + 'a) -> Task<T> {
         unsafe {
             let origin = self.state.origin;
             let (runnable, task) = Builder::new()
+                // .
                 .propagate_panic(true)
                 // .
                 .spawn_unchecked(
@@ -137,6 +170,11 @@ impl<'a> Executor<'a> {
         };
 
         future::or(self.spawn(fut),  runner.run()).await
+    }
+    pub fn block_on<T: 'a>(&'a self, fut: impl Future<Output = T> + 'a) -> T {
+   
+        
+        smol::block_on(self.run(fut))
     }
 }
 
@@ -239,14 +277,74 @@ impl<'a> Runner<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, rc::Rc, task::{Poll, Waker}};
+
+    use flume::Sender;
     use smol::future::{self};
 
-    use crate::core::executor::scheduler::Executor;
+    use crate::core::{executor::scheduler::Executor, shard::state::ShardId};
 
 
     #[test]
+
+    pub fn test_separate_waker() {
+
+        let (tx, rx) = flume::unbounded();
+
+        struct Fut {
+            name: usize,
+            source: Sender<(usize, Waker)>
+        }
+
+        impl Future for Fut {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+                
+                println!("Polling: {}", self.name);
+                self.source.send((self.name, cx.waker().clone())).unwrap();
+
+                Poll::Pending
+            }
+        }
+
+        let a = Fut {
+            name: 0,
+            source: tx.clone()
+        };
+
+        let b = Fut {
+            name: 1,
+            source: tx.clone()
+        };
+
+        let executor = Executor::new(ShardId::new(0)).leak();
+        executor.block_on(async move {
+
+            executor.spawn(a).detach();
+            executor.spawn(b).detach();
+            let mut reso = vec![];
+            for _ in 0..2 {
+                reso.push(rx.recv_async().await.unwrap());
+            }
+
+            reso.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+            assert!(!reso[0].1.will_wake(&reso[1].1));
+
+            // println!("RESO: {:?}", reso[0].1.will_wake(&reso[1].1));
+
+            // assert!(smol::future::poll_once(a).awai)
+            
+
+            Ok::<_, anyhow::Error>(())
+
+        }).unwrap();
+
+    }
+
+    #[test]
     pub fn test_basic_scheduler() {
-        let executor = Executor::new();
+        let executor = Executor::new(ShardId::new(0));
         let y = future::block_on(executor.run(async {
             1
         }));

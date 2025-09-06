@@ -103,7 +103,7 @@ impl IoRingDriver {
             .build(entries)?;
 
         // First we will check compatibility.
-        println!("Running compat check.");
+        // println!("Running compat check.");
         perform_compatibility_checks(&mut ring)?;
  // ring.submission().push(&)
         

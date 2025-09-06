@@ -1,12 +1,11 @@
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 
-use async_executor::StaticLocalExecutor;
-use smol::LocalExecutor;
 
 use crate::core::channels::promise::SyncPromiseResolver;
+use crate::core::executor::scheduler::Executor;
+use crate::core::topology::TopologicalInformation;
 use crate::core::{shard::error::ShardError, task::Task};
-use crate::core::channels::{Sender, Receiver};
+use crate::core::channels::Sender;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,23 +22,38 @@ impl ShardId {
 }
 
 pub struct ShardCtx {
-    id: ShardId,
+    pub id: ShardId,
     pub table: ShardMapTable,
+    pub top_info: TopologicalInformation,
+    pub executor: Executor<'static>,
     _unsend: PhantomData<*const ()>
 }
 
 impl ShardCtx {
-    pub(crate) fn new(core: ShardId, table: ShardMapTable) -> Self {
+    pub(crate) fn new(core: ShardId, info: TopologicalInformation, table: ShardMapTable) -> Self {
         Self {
             id: core,
             table,
+            top_info: info,
+            executor: Executor::new(core),
             _unsend: PhantomData
         }
     }
 }
 
 pub struct ShardRuntime {
+    pub id: ShardId,
+    // office: ShardActorOffice
     // pub executor: &'a LocalExecutor<'a>
+}
+
+impl ShardRuntime {
+    pub fn new(core: ShardId) -> Self {
+        Self {
+            id: core,
+            // office: ShardActorOffice::new()
+        }
+    }
 }
 
 pub struct ShardMapTable {
@@ -81,7 +95,7 @@ pub(crate) enum ShardConfigMsg {
         queue: Sender<Task>
     },
     RequestEntry {
-        requester: ShardId,
+        // requester: ShardId,
         queue: SyncPromiseResolver<Sender<Task>>
     },
     FinalizeConfiguration(SyncPromiseResolver<()>)

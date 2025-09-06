@@ -185,7 +185,7 @@ mod tests {
     use flume::unbounded;
     
 
-    use crate::core::{executor::scheduler::Executor, io::net::TcpStream};
+    use crate::core::{executor::scheduler::Executor, io::net::TcpStream, shard::state::ShardId};
 
     enum IpTestPacket {
         Addr(std::net::SocketAddr),
@@ -219,7 +219,7 @@ mod tests {
             }
         });
 
-        let execuor = Executor::new();
+        let execuor = Executor::new(ShardId::new(0));
         smol::future::block_on(execuor.run(async {
             //         let to_connect = rx.await.unwrap();
             // println!("tto_connect: {:?}", to_connect);
@@ -269,7 +269,7 @@ mod tests {
             }
         });
 
-        let execuor = Executor::new();
+        let execuor = Executor::new(ShardId::new(0));
         smol::future::block_on(execuor.run(async {
             //         let to_connect = rx.await.unwrap();
             // println!("tto_connect: {:?}", to_connect);
@@ -330,7 +330,7 @@ mod tests {
             }
         });
 
-        let execuor = Executor::new();
+        let execuor = Executor::new(ShardId::new(0));
         smol::future::block_on(execuor.run(async {
             //         let to_connect = rx.await.unwrap();
             // println!("tto_connect: {:?}", to_connect);
@@ -398,7 +398,7 @@ mod tests {
             }
         });
 
-        let execuor = Executor::new();
+        let execuor = Executor::new(ShardId::new(0));
         smol::future::block_on(execuor.run(async {
             //         let to_connect = rx.await.unwrap();
             // println!("tto_connect: {:?}", to_connect);
