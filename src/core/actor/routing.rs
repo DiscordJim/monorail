@@ -37,6 +37,7 @@ where
 pub struct RouterState<A>
 where
     A: Actor,
+    Router<A>: Actor
 {
     targets: Vec<LocalRouterCtx<A>>,
     last_shot: usize,
@@ -50,7 +51,7 @@ where
 {
     First,
     RoundRobin,
-    RoutingFn(Box<dyn Fn(&A::Message, usize) -> usize>)
+    RoutingFn(Box<dyn Fn(&A::Message, usize, &mut usize) -> usize>)
 }
 
 pub enum RouterSpawnPolicy {
@@ -60,10 +61,12 @@ pub enum RouterSpawnPolicy {
 pub struct RouterArguments<A>
 where
     A: Actor,
+    Router<A>: Actor
 {
     pub arguments: A::Arguments,
     pub spawn_policy: RouterSpawnPolicy,
     pub routing_policy: RoutingPolicy<A>,
+    pub transformer: fn(&<Router<A> as Actor>::Arguments, usize) -> A::Arguments
 }
 
 pub struct RoutedMessage<A>
@@ -150,7 +153,7 @@ where
                 prev
             }
             RoutingPolicy::RoutingFn(functor) => {
-                let decision = functor(&message, state.targets.len());
+                let decision = functor(&message, state.targets.len(), &mut state.last_shot);
                 if decision >= state.targets.len() {
                     return Err(anyhow!("Routing function pointed to {decision}, which is out of bounds."));
                 }
@@ -183,7 +186,7 @@ where
             // println!("Starting actor on {i}");
             let args_copy = state.arguments.arguments.clone();
             let forn = this
-                .spawn_linked_foreign::<A>(ShardId::new(i), args_copy)
+                .spawn_linked_foreign::<A>(ShardId::new(i), (state.arguments.transformer)(&state.arguments, i))
                 .await?;
 
                 // println!("Forn: {:?}", forn.signal);
@@ -274,6 +277,7 @@ mod tests {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
                         routing_policy: RoutingPolicy::RoundRobin,
+                        transformer: |a, b| a.arguments
                     })
                     .unwrap();
 
@@ -356,6 +360,7 @@ mod tests {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
                         routing_policy: RoutingPolicy::RoundRobin,
+                        transformer: |a, _| a.arguments
                     })
                     .unwrap();
 
@@ -423,9 +428,10 @@ mod tests {
                     let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
-                        routing_policy: RoutingPolicy::RoutingFn(Box::new(|msg: &(usize, oneshot::Sender<(ShardId, usize)>), targets| {
+                        routing_policy: RoutingPolicy::RoutingFn(Box::new(|msg: &(usize, oneshot::Sender<(ShardId, usize)>), targets, _| {
                             msg.0
                         })),
+                        transformer: |a, _| a.arguments
                     })
                     .unwrap();
 

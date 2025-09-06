@@ -22,7 +22,7 @@ where
     pub fn new() -> Result<Self> {
         let (foreign, _) = spawn_actor::<Router<HashMapShardActor<K, V>>>(RouterArguments {
             arguments: (),
-            routing_policy: RoutingPolicy::RoutingFn(Box::new(|message, targets| {
+            routing_policy: RoutingPolicy::RoutingFn(Box::new(|message, targets, _| {
 
 
                 let key: &K = match &message {
@@ -35,10 +35,11 @@ where
                 let mut hasher = DefaultHasher::new();
                 key.hash(&mut hasher);
                 let reso = hasher.finish();
-                
+
                 (reso % targets as u64) as usize
             })),
-            spawn_policy: RouterSpawnPolicy::PerCore
+            spawn_policy: RouterSpawnPolicy::PerCore,
+            transformer: |a, _| a.arguments
         })?;
 
         Ok(ShardedHashMap {
@@ -122,7 +123,7 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
-            |runtime| {
+            |_| {
                 submit_task_to(ShardId::new(0), async move || {
                     let map = ShardedHashMap::<String, usize>::new().unwrap();
 
