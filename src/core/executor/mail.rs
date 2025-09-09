@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    // collections::HashMap,
     marker::PhantomData, rc::Rc,
 };
 
@@ -176,7 +176,7 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(3)
                 .build(),
-            |_| {
+            async || {
                 let (foreign, _) = spawn_actor::<BasicActor>(()).expect("Failed to create basic actor.");
                 submit_to(ShardId::new(1), async move || {
                     assert_eq!(foreign.call(1).await.expect("Failed to get result."), 2);

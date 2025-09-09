@@ -689,9 +689,11 @@ where
 
         let (tx, rx) = oneshot::channel();
 
+        println!("Started a call. -> {:?}", self.signal.shard);
         // println!("[C] Started a call. {:?}", thread::current().id());
         submit_to(self.signal.shard, async move || {
             // spawn_async_task(future)
+            println!("Submitted!");
             let Some(addr) = get_actor_addr(addr2) else {
                 let _ = tx.send(Err(anyhow!(
                     "Failed to actually find the actor on the other core."
@@ -701,7 +703,7 @@ where
             // println!("[C] Actor address. {:?}", thread::current().id());
 
             spawn_async_task(async move {
-                // println!("[C] Spawned fetcher. {:?}", thread::current().id());
+                // println!("[C] Spawned fetcher. {:?}", false);
                 match addr.call(param).await {
                     Ok(v) => {
                         // println!("[C] Resolved a call OK. {:?}", thread::current().id());

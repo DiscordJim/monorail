@@ -95,10 +95,12 @@ where
         msg: M,
         state: &'a mut Self::State,
     ) -> Self::Output {
+        println!("Router is getting called.");
         if state.targets.is_empty() {
             return Err(anyhow!("No actors to route to."));
         }
 
+        
      
 
         let policy = <A as CallRoutePolicy<M>>::route(&msg, state.targets.len(), &mut state.last_shot);
@@ -281,7 +283,7 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
-            |init| {
+            async || {
                 spawn_async_task(async move {
                     let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
@@ -373,7 +375,7 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
-            |init| {
+            async || {
                 submit_to(ShardId::new(0), || async move {
                     let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
@@ -382,17 +384,21 @@ mod tests {
                         transformer: |a, _| a.arguments
                     })
                     .unwrap();
-                // Timer::after(Duration::from_millis(250)).await;
+                // // Timer::after(Duration::from_millis(250)).await;
+
+                    // println!("locked in");
 
 
                     let result = forn
                         .call(5)
                         .await
                         .unwrap()
+                        .inspect_err(|e| println!("der wa err"))
                         .expect("Failed to process the routed message.");
                     assert_eq!(result.responder, 5);
                     assert_eq!(result.message, 6);
 
+                //     println!("Flag A");
 
                     let result = forn
                         .call(4)
@@ -444,7 +450,7 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
-            |init| {
+            async|| {
                 submit_to(ShardId::new(0), || async move {
                     let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),

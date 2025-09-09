@@ -5,7 +5,7 @@ use crate::core::channels::bridge::{Bridge, BridgeConsumer, BridgeProducer, Rx, 
 use crate::core::channels::promise::SyncPromiseResolver;
 use crate::core::executor::scheduler::Executor;
 use crate::core::topology::TopologicalInformation;
-use crate::core::{shard::error::ShardError, task::Task};
+use crate::core::{shard::error::ShardError};
 use crate::core::channels::Sender;
 
 
@@ -42,29 +42,25 @@ impl ShardCtx {
     }
 }
 
-pub struct ShardRuntime {
-    pub id: ShardId,
-    // office: ShardActorOffice
-    // pub executor: &'a LocalExecutor<'a>
-}
+// pub struct ShardRuntime {
+//     pub id: ShardId,
+//     // office: ShardActorOffice
+//     // pub executor: &'a LocalExecutor<'a>
+// }
 
-impl ShardRuntime {
-    pub fn new(core: ShardId) -> Self {
-        Self {
-            id: core,
-            // office: ShardActorOffice::new()
-        }
-    }
-}
+// impl ShardRuntime {
+//     pub fn new(core: ShardId) -> Self {
+//         Self {
+//             id: core,
+//             // office: ShardActorOffice::new()
+//         }
+//     }
+// }
 
 pub struct ShardMapTable {
     pub table: Box<[Bridge]>
 }
 
-
-pub struct ShardMapEntry {
-    pub queue: crate::core::channels::Sender<Task>
-}
 
 
 

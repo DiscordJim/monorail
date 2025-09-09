@@ -123,7 +123,7 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
-            |_| {
+            async || {
                 submit_to(ShardId::new(0), async move || {
                     let map = ShardedHashMap::<String, usize>::new().unwrap();
 

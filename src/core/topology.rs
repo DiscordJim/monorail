@@ -1,15 +1,15 @@
-use std::{any::Any, panic::AssertUnwindSafe};
+use std::{any::Any, future::Future, panic::AssertUnwindSafe};
 
 use flume::Sender;
 
 use crate::core::{
-    channels::{bridge::{box_job, BridgedTask}, promise::SyncPromise},
+    channels::promise::SyncPromise,
     shard::{
         error::ShardError,
-        shard::{setup_shard, signal_monorail, MONITOR},
-        state::{ShardConfigMsg, ShardId, ShardRuntime},
+        shard::{access_shard_ctx_ref, setup_shard, signal_monorail, MONITOR},
+        state::{ShardConfigMsg, ShardId},
     },
-    task::{self, Task},
+    task::{self, Task, TaskControlBlock, TaskControlHeader},
 };
 
 pub struct MonorailTopology {}
@@ -30,6 +30,9 @@ pub struct MonorailConfiguration {
 impl MonorailConfigurationBuilder {
     /// The core override configures how many shards will be configured.
     /// If this is left unset, this is set to the number of logical cores.
+    /// 
+    /// Note that this may cause shard-core-wrapping which is when the shards
+    /// exceeds the cores, causing multiple to be spawned. Please avoid this!
     ///
     /// **RECOMMENDATION:** If you are not running a test, it is highly recommended
     /// to just leave this to the default and keep it unset.
@@ -51,10 +54,12 @@ impl MonorailConfiguration {
 }
 
 impl MonorailTopology {
-    pub fn setup<F>(config: MonorailConfiguration, init: F) -> Result<Self, TopologyError>
+    pub fn setup<T, F>(config: MonorailConfiguration, init: T) -> Result<Self, TopologyError>
     where
-        F: FnOnce(&mut ShardRuntime) + Send + 'static,
+        T: FnOnce() -> F + Send + 'static,
+        F: Future<Output = ()> + 'static
     {
+        println!("Launching topology...");
         launch_topology(config.limit.unwrap_or(num_cpus::get()), init)?;
 
         Ok(Self {})
@@ -66,6 +71,7 @@ fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError
     let configurations = (0..core_count)
         .map(|i| setup_shard(ShardId::new(i), core_count))
         .collect::<Result<Vec<_>, ShardError>>()?;
+    println!("We are configuring {core_count} shards with only {} cores.", num_cpus::get());
     for x in 0..core_count {
         for y in 0..core_count {
             let (tx, rx) = SyncPromise::new();
@@ -81,11 +87,21 @@ fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError
                 .map_err(|_| TopologyError::ShardClosedPrematurely)?;
             if x == 0 && y == 0 {
                 let (seed_tx, seed_rx) = flume::unbounded();
-                let _ = queue.send(BridgedTask::FireAndForget(box_job(async move || {
-                    let task: Box<dyn FnOnce(&mut ShardRuntime) + Send + 'static> = seed_rx.recv_async().await.unwrap();
+
+                println!("bringing da queue...");
+                let initial = TaskControlBlock::create(TaskControlHeader::FireAndForget, async move || {
+                    println!("Erm... {:?}", seed_rx.len());
+                    let task: Box<dyn FnOnce() + Send + 'static>  = seed_rx.recv_async().await.unwrap();
+                    task();
+                });
+                let _ = queue.send(initial);
+                println!("Sent a seed task.");
+
+                // let _ = queue.send(BridgedTask::FireAndForget(box_job(async move || {
+                //     let task: Box<dyn FnOnce() + Send + 'static> = seed_rx.recv_async().await.unwrap();
                     
-                    task(&mut ShardRuntime::new(ShardId::new(0)));
-                })));
+                //     task();
+                // })));
                 seed_queue = Some(seed_tx);
             }
 
@@ -112,9 +128,10 @@ fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError
     Ok(seed_queue.unwrap())
 }
 
-fn launch_topology<F>(core_count: usize, seeder_function: F) -> Result<(), TopologyError>
+fn launch_topology<T, F>(core_count: usize, seeder_function: T) -> Result<(), TopologyError>
 where
-    F: FnOnce(&mut ShardRuntime) + Send + 'static,
+    T: FnOnce() -> F + Send + 'static,
+    F: Future<Output = ()> + 'static
 {
     let (promise, resolver) = SyncPromise::<Result<(), Box<dyn Any + Send + 'static>>>::new();
     // std::mem::forget(resolver);
@@ -122,26 +139,14 @@ where
     let seeder = setup_basic_topology(core_count)?;
     // println!("Set up...");
     seeder
-        .send(Box::new(move |runtime| {
-            // println!("hello...");
-            match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        .send(Box::new(|| {
+            // println!("hello");
 
-                 unsafe { 
-                    // println!("HELLO");
-                        MONITOR.with(|f| {
-                            (*f.get()) = Some(resolver);
-                        });
-                        // println!("SET RUNTIME...");
-                     }
+            MONITOR.with(|f| {
+                unsafe { *(&mut *f.get()) = Some(resolver); }
+            });
 
-                seeder_function(runtime)
-            })) {
-                Ok(_) => {},
-                Err(e) => {
-                    signal_monorail(Err(e));
-                    // resolver.resolve(Err(e));
-                }
-            }
+            access_shard_ctx_ref().executor.spawn(seeder_function()).detach();
         }))
         .map_err(|_| TopologyError::SeedFailure)?;
 
@@ -166,14 +171,14 @@ mod tests {
         sync::{LazyLock, Mutex}
     ;
 
-    use crate::core::{
+    use crate::{core::{
         channels::promise::{SyncPromise, SyncPromiseResolver},
         shard::{
             shard::{shard_id, signal_monorail, submit_to},
-            state::{ShardId, ShardRuntime},
+            state::ShardId,
         },
         topology::{MonorailConfiguration, MonorailTopology},
-    };
+    }, monolib};
 
     #[test]
     pub fn test_launch_single_core_topology() {
@@ -181,8 +186,8 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(1)
                 .build(),
-            |d| {
-                assert_eq!(d.id, ShardId::new(0));
+            async || {
+                assert_eq!(shard_id(), ShardId::new(0));
                 signal_monorail(Ok(()));
                 // ControlFlow::Break(())
             },
@@ -197,7 +202,7 @@ mod tests {
 
         fn jmp(resolver: SyncPromiseResolver<()>) {
             MERRY_GO_ROUND.lock().unwrap().push(shard_id().as_usize());
-            // println!("Broadcasting from {:?}", shard_id());
+            println!("Broadcasting from {:?}", shard_id());
             if shard_id().as_usize() < 5 {
                 submit_to(ShardId::new(shard_id().as_usize() + 1), async || {
                     jmp(resolver)
@@ -211,7 +216,8 @@ mod tests {
             MonorailConfiguration::builder()
                 .with_core_override(6)
                 .build(),
-            move |d| {
+            async || {
+                // println!("hello... (from async)");
                 let (rx, tx) = SyncPromise::new();
                 jmp(tx);
                 rx.wait().unwrap();
@@ -222,5 +228,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(&*MERRY_GO_ROUND.lock().unwrap(), &[0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    pub fn test_choked_cores() {
+        // TEST: Specifying a core ovveride greater than the CPU count.
+        static MERRY_GO_ROUND: LazyLock<Mutex<Vec<usize>>> =
+            LazyLock::new(|| Mutex::new(Vec::new()));
+
+        fn jmp(resolver: SyncPromiseResolver<()>) {
+            MERRY_GO_ROUND.lock().unwrap().push(shard_id().as_usize());
+            // println!("Broadcasting from {:?} {:?}", shard_id(), top);
+            if shard_id().as_usize() < monolib::get_topology_info().cores - 1 {
+                submit_to(ShardId::new(shard_id().as_usize() + 1), async || {
+                    jmp(resolver)
+                });
+            } else {
+                println!("Resolving...");
+                resolver.resolve(());
+            }
+        }
+
+        // println!("Spawning with: {:?}", num_cpus::get() + 1);
+
+        MonorailTopology::setup(
+            MonorailConfiguration::builder()
+                .with_core_override(num_cpus::get() + 1)
+                .build(),
+            async || {
+                // println!("hello... (from async)");
+                let (rx, tx) = SyncPromise::new();
+                jmp(tx);
+                rx.wait().unwrap();
+                signal_monorail(Ok(()));
+                // ControlFlow::Break(())
+            },
+        )
+        .unwrap();
+
+
+        let mut ar = vec![];
+        for i in 0..num_cpus::get() + 1 {
+            ar.push(i);
+        }
+
+        assert_eq!(&*MERRY_GO_ROUND.lock().unwrap(), &ar);
     }
 }

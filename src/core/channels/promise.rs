@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, UnsafeCell}, future::Future, mem::MaybeUninit, rc::Rc, sync::{
+    any::Any, cell::{Cell, UnsafeCell}, future::Future, mem::MaybeUninit, rc::Rc, sync::{
         atomic::{AtomicU8, Ordering},
         Arc,
     }, task::{Poll, Waker}, thread::{current, park, Thread}
@@ -13,9 +13,29 @@ pub struct Promise<T> {
 struct PromiseInternal<T> {
     is_ready: Cell<PromiseState>,
     waker: UnsafeCell<MaybeUninit<Waker>>,
-    value: UnsafeCell<MaybeUninit<T>>,
+    value: UnsafeCell<MaybeUninit<PromiseSlot<T>>>,
     
 }
+
+impl PartialEq for PromiseError {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            PromiseError::PromiseClosed => matches!(other, PromiseError::PromiseClosed),
+            PromiseError::Paniced(e) => match other {
+                PromiseError::PromiseClosed => false,
+                PromiseError::Paniced(f) => true
+            }
+        }
+    }
+}
+
+
+enum PromiseSlot<T> {
+    Value(T),
+    Error(Box<dyn Any + Send + 'static>)
+}
+
+// impl PartialEq for Pro
 
 pub struct PromiseResolver<T> {
     internal: Rc<PromiseInternal<T>>
@@ -46,7 +66,8 @@ enum PromiseState {
     Idle,
     Wait,
     Ready,
-    Closed
+    Closed,
+    // Panicked
 }
 
 
@@ -55,7 +76,21 @@ impl<T> PromiseResolver<T> {
     pub fn is_closed(&self) -> bool {
         self.internal.is_ready.get() == PromiseState::Closed
     }
+    pub fn reject_panic(self, panic_info: Box<dyn Any + Send + 'static>) {
+        let _  = self.resolve_internal(PromiseSlot::Error(panic_info));
+    }
     pub fn resolve(self, value: T) -> Result<(), (T, PromiseError)> {
+
+        match self.resolve_internal(PromiseSlot::Value(value)) {
+            Ok(prom ) => Ok(()),
+            Err((slot, error)) => match slot {
+                PromiseSlot::Error(e) => unreachable!(),
+                PromiseSlot::Value(v) => Err((v, error))
+            }
+        }
+
+    }
+    fn resolve_internal(self, value: PromiseSlot<T>) -> Result<(), (PromiseSlot<T>, PromiseError)> {
         println!("Resolving a promise...");
         match self.internal.is_ready.get() {
             PromiseState::Closed => {
@@ -64,6 +99,7 @@ impl<T> PromiseResolver<T> {
             PromiseState::Idle => {
                 // In this case there is no waker present yet.
                 unsafe { (&mut *self.internal.value.get()).write(value) };
+                // println!("Set the ")
                 self.internal.is_ready.set(PromiseState::Ready);
                 Ok(())
 
@@ -78,8 +114,6 @@ impl<T> PromiseResolver<T> {
                     (&*self.internal.waker.get()).assume_init_ref().wake_by_ref();
                     Ok(())
                  }
-
-                
             }
 
         }
@@ -88,12 +122,18 @@ impl<T> PromiseResolver<T> {
 
 impl<T> Drop for PromiseResolver<T> {
     fn drop(&mut self) {
+        // println!("ropping a promise resolver... {:?}", self.internal.is_ready.get());
         match self.internal.is_ready.get() {
             PromiseState::Closed => {
                 // Do nothing.
             }
-            PromiseState::Idle | PromiseState::Wait => {
+            PromiseState::Idle => {
                 self.internal.is_ready.set(PromiseState::Closed);
+                // unsafe { (&*self.internal.waker.get()).assume_init_ref().wake_by_ref() };
+            }
+            PromiseState::Wait => {
+                self.internal.is_ready.set(PromiseState::Closed);
+                unsafe { (&*self.internal.waker.get()).assume_init_ref().wake_by_ref() };
             }
             PromiseState::Ready => {
                 // Do nothing.
@@ -135,7 +175,15 @@ impl<T> Future for Promise<T> {
             }
             PromiseState::Ready => {
                 self.internal.is_ready.set(PromiseState::Closed);
-                Poll::Ready(Ok(unsafe { (&mut *self.internal.value.get()).assume_init_read() }))
+
+                let value = unsafe { (&mut *self.internal.value.get()).assume_init_read() };
+
+                match value {
+                    PromiseSlot::Error(e) => Poll::Ready(Err(PromiseError::Paniced(e))),
+                    PromiseSlot::Value(v) => Poll::Ready(Ok(v))
+                }
+
+                // Poll::Ready(Ok(unsafe {  }))
                 // Poll::Ready(Err())
             }
             PromiseState::Wait => {
@@ -220,10 +268,12 @@ impl<T> Drop for SyncPromiseResolver<T> {
 
 unsafe impl<T: Send> Send for SyncPromiseResolver<T> {}
 
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug)]
 pub enum PromiseError {
     #[error("The promise closed on the other end.")]
     PromiseClosed,
+    #[error("The promise has panicked.")]
+    Paniced(Box<dyn Any + Send + 'static>)
 }
 
 // impl<T> SyncPromise<T> {
@@ -249,7 +299,7 @@ mod tests {
     pub fn test_sync_promise() {
         let (promise, resolver) = SyncPromise::<u8>::new();
         resolver.resolve(3);
-        assert_eq!(promise.wait(), Ok(3));
+        assert_eq!(promise.wait().unwrap(), 3);
     }
 
     #[test]
@@ -306,6 +356,27 @@ mod tests {
     }
 
      #[test]
+    pub fn test_async_promise_close_receiver_before_poll() {
+
+        let (promise, resolver) = Promise::<usize>::new();
+        
+        let mut ctx = Context::from_waker(Waker::noop());
+
+        let mut waiting = std::pin::pin!(promise);
+        
+        drop(resolver);
+        // drop(promise);
+        
+        // assert!(resolver.resolve(3).is_err());
+        assert_eq!(waiting.as_mut().poll(&mut ctx), Poll::Ready(Err(PromiseError::PromiseClosed)));
+
+
+     
+        
+
+    }
+
+     #[test]
     pub fn test_async_promise_close_receiver() {
 
         let (promise, resolver) = Promise::<usize>::new();
@@ -313,6 +384,8 @@ mod tests {
         let mut ctx = Context::from_waker(Waker::noop());
 
         let mut waiting = std::pin::pin!(promise);
+
+        let _ = waiting.as_mut().poll(&mut ctx);
         
         drop(resolver);
         // drop(promise);

@@ -1,57 +1,70 @@
 use std::{
-    any::Any, cell::RefCell, future::Future, marker::PhantomData, mem::ManuallyDrop, pin::Pin, ptr::null_mut, sync::{
+    any::Any,
+    cell::RefCell,
+    future::Future,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    pin::Pin,
+    ptr::null_mut,
+    sync::{
         atomic::{AtomicPtr, Ordering},
         Arc,
-    }, task::{Poll, Waker}
+    },
+    task::{Poll, Waker},
 };
 
 use heapless::spsc::{Consumer, Producer, Queue};
 use slab::Slab;
 
 use crate::core::{
-    channels::promise::{Promise, PromiseResolver},
-    shard::{shard::{access_shard_ctx_ref, shard_id}, state::ShardRuntime},
-    task::Task,
+    channels::promise::{Promise, PromiseError, PromiseResolver},
+    shard::{
+        shard::{access_shard_ctx_ref, get_remote_brige, shard_id, submit_to},
+        state::ShardId,
+    }, task::{TaskControlBlock, TaskControlBlockVTable, TaskControlHeader, TcbInit, TcbResult},
 };
 
-pub type AsyncTask =
-    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + Send + 'static>;
-
-pub type AsyncTaskWithResult =
-    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Box<dyn Any + Send + 'static>> + 'static>> + Send + 'static>;
 
 
-pub enum BridgedTask {
-    FireAndForget(AsyncTask),
-    FireWithTicket {
-        task: AsyncTaskWithResult,
-        ticket_id: usize
-    }
-}
+// pub enum BridgedTask {
+//     FireAndForget(TaskControlBlockVTable<TcbInit>),
+//     FireWithTicket {
+//         task: TaskControlBlockVTable<TcbInit>,
+//         ticket_id: usize,
+//         origin: ShardId,
+//     },
+// }
 
 // struct Br/
+
+pub type BridgeMessage = TaskControlBlockVTable<TcbInit>;
 
 pub struct Tx;
 pub struct Rx;
 
 pub struct BridgeProducer<M> {
-    queue: Producer<'static, BridgedTask>,
+    queue: Producer<'static, TaskControlBlockVTable<TcbInit>>,
     waker: BridgeWakeCtx, // waker: Arc<AtomicPtr<Waker>>
-    _marker: PhantomData<M>
+    _marker: PhantomData<M>,
 }
+
+// pub struct BridgeMessage {
+//     task: BridgedTask,
+//     // origin: ShardId,
+// }
 
 pub struct BridgeConsumer<M> {
-    queue: Consumer<'static, BridgedTask>,
+    queue: Consumer<'static, TaskControlBlockVTable<TcbInit>>,
     waker: BridgeWakeCtx,
-    _marker: PhantomData<M>
+    _marker: PhantomData<M>,
 }
 
-pub struct BridgeConsumerFut<'a, M> {
-    consumer: &'a mut BridgeConsumer<M>
+pub(crate) struct BridgeConsumerFut<'a, M> {
+    consumer: &'a mut BridgeConsumer<M>,
 }
 
 impl<'a, M> Future for BridgeConsumerFut<'a, M> {
-    type Output = BridgedTask;
+    type Output = TaskControlBlockVTable<TcbInit>;
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -75,11 +88,15 @@ impl<M> BridgeConsumer<M> {
 }
 
 impl<M> BridgeProducer<M> {
-    pub fn send(&mut self, task: BridgedTask) -> Result<(), BridgedTask> {
-        self.queue.enqueue(task)?;
+    pub fn send(&mut self, task: TaskControlBlockVTable<TcbInit>) -> Result<(), TaskControlBlockVTable<TcbInit>> {
+        self.queue
+            .enqueue(task)?;
         self.waker.wake_by_ref();
         Ok(())
     }
+    // pub fn put_backlog(&mut self, task: BridgedTask) -> Result<()> {
+    //     self
+    // }
 }
 
 struct BridgeWakeCtx {
@@ -121,14 +138,17 @@ impl BridgeWakeCtx {
 pub struct Bridge {
     send_queue: RefCell<BridgeProducer<Rx>>,
     recv_queue: RefCell<BridgeConsumer<Tx>>,
-    back_log: Vec<BridgedTask>,
-    arena: RefCell<Slab<PromiseResolver<Box<dyn Any + Send>>>>,
+    back_log: Vec<TaskControlBlockVTable<TcbInit>>,
+    arena: RefCell<Slab<PromiseResolver<TaskControlBlockVTable<TcbResult>>>>,
 }
 
 impl Bridge {
     pub fn create_queues<A, B>() -> (BridgeProducer<A>, BridgeConsumer<B>) {
-        let queue = Box::leak(Box::new(Queue::<BridgedTask, 128>::new()));
+        let queue = Box::leak(Box::new(Queue::<TaskControlBlockVTable<TcbInit>, 128>::new()));
+        // Producer::
         let (producer, consumer) = queue.split();
+
+        // let consumer: Consumer<'static, TaskControlBlockVTable<TcbResult>> = unsafe { std::mem::transmute(consumer) };
 
         let wake = Arc::new(AtomicPtr::new(null_mut()));
         let (a, b) = (
@@ -144,12 +164,12 @@ impl Bridge {
             BridgeProducer {
                 queue: producer,
                 waker: a,
-                _marker: PhantomData
+                _marker: PhantomData,
             },
             BridgeConsumer {
                 queue: consumer,
                 waker: b,
-                _marker: PhantomData
+                _marker: PhantomData,
             },
         )
     }
@@ -163,114 +183,189 @@ impl Bridge {
     }
 }
 
-impl Bridge {
-    pub fn fire_and_forget(&self, task: AsyncTask) {
-        let _ = self.send_queue.borrow_mut().send(BridgedTask::FireAndForget(task));
-    }
-    // pub async fn fire_with_ticket() {
-    //     let (rx, tx) = Promise::<BridgedTask>::new();
 
-    // }
+impl Bridge {
+    pub fn fire_and_forget<F, FUT>(&self, task: F)
+    where 
+        F: FnOnce() -> FUT + Send + 'static,
+        FUT: Future<Output = ()> + 'static
+    {
+
+        let block = TaskControlBlock::create(TaskControlHeader::FireAndForget, task);
+
+
+        let _ = self
+            .send_queue
+            .borrow_mut()
+            .send(block);
+    }
+    pub async fn fire_with_ticket<T, F, O>(
+        &self,
+        task: T,
+    ) -> Result<O, PromiseError>
+    where 
+        T: FnOnce() -> F + Send + 'static,
+        F: Future<Output = O> + 'static,
+        O: Send + 'static
+    {
+
+        let (rx, tx) = Promise::new();
+        let ticket_id = self.arena.borrow_mut().insert(tx);
+        let block = TaskControlBlock::create(TaskControlHeader::WithReturn {
+            origin: shard_id(),
+            ticket: ticket_id
+        }, task);
+        
+        let _ = self
+            .send_queue
+            .borrow_mut()
+            .send(block);
+
+        let payload = unsafe { rx.await?.get_result::<O>() };
+
+        Ok(payload)
+    }
     pub async fn run_bridge(&self) {
         let mut rcv = self.recv_queue.borrow_mut();
         loop {
             let r = rcv.recv().await;
-            match r {
-                BridgedTask::FireAndForget(task) => {
-                    // let fut = std::pin::pin!(task(runtime));
-                    // task().await;
-                    access_shard_ctx_ref().executor.spawn(task()).detach();
+            // println!("I am {:?} receiving a control block.", shard_id());
+            match *r.header() {
+                TaskControlHeader::FireAndForget => {
+                    // println!("Rcv FF task");
+                    // let t = r.run().await;
+                    // println!("Terminated FF task");
+                    access_shard_ctx_ref().executor.spawn(r.run().map_err(|e| ()).unwrap()).detach();
                 }
-                BridgedTask::FireWithTicket { task, ticket_id } => {
-                    let (rx, tx) = Promise::new();
-                    let ticket = self.arena.borrow_mut().insert(tx);
-                    let origin = shard_id();
-                    access_shard_ctx_ref().executor.spawn(async move {
+                TaskControlHeader::WithReturn {
+                    // task,
+                    // ticket_id,
+                    ticket: ticket_id,
+                    origin: source,
+                } => {
+                    let current = shard_id();
+                    access_shard_ctx_ref()
+                        .executor
+                        .spawn(async move {
+                            // let task = access_shard_ctx_ref().executor.spawn(async move {
+                                let mut guard = BridgeDropCancelGuard {
+                                    origin: source,
+                                    current,
+                                    slot: ticket_id,
+                                    resolved: false
+                                };
+                                let reso = r.run().map_err(|_| ()).unwrap().await;
+                                // let reso = unsafe { reso.get_result::<O>() };
 
-                        let reso = task().await;
+                                // let ticket = *ticket_id;
 
-                        
-                        
+                               
+                                // println!("Done (B)");
+                                submit_to(source, async move || {
+                                    let bridge = get_remote_brige(current);
 
+                                    match reso {
+                                        Err(e) => {
+                                            let _ = bridge.arena.borrow_mut().remove(ticket_id).reject_panic(e.get_panic());
+                                        }
+                                        Ok(v) => {
+                                            let _ = bridge.arena.borrow_mut().remove(ticket_id).resolve(v);
+                                        }
+                                    }
 
-                    }).detach();
+                                    // let _ =
+                                    //     bridge.arena.borrow_mut().remove(ticket_id).resolve(reso);
+                                });
+
+                                 guard.resolved = true;
+              
+                            // });
+
+                          
+
+                            // task.detach();
+                        })
+                        .detach();
                 }
-                 // BridgedTask::FireWithTicket { task, ticket_id } => {
-                  //     task(runtime);
-                  // }
             }
         }
     }
     // pub async fn tick()
 }
 
-pub(crate) fn box_job<F, FUT>(task: F) -> AsyncTask
-where
-    F: FnOnce() -> FUT + Send + 'static,
-    FUT: Future<Output = ()> + 'static
-{
-
-    Box::new(move || Box::pin(task()))
-
+struct BridgeDropCancelGuard {
+    origin: ShardId,
+    current: ShardId,
+    slot: usize,
+    resolved: bool
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use futures::channel::oneshot;
+impl Drop for BridgeDropCancelGuard {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let origin = self.origin;
+        let current = self.current;
+        let slot = self.slot;
+        submit_to(origin, async move || {
+            let bridge = get_remote_brige(current);
+            let _ = bridge.arena.borrow_mut().remove(slot);
+        });
+    }
+}
 
-//     use crate::core::{
-//         channels::bridge::Bridge,
-//         shard::{
-//             shard::{spawn_async_task, submit_task_to},
-//             state::{ShardId, ShardRuntime},
-//         },
-//         topology::{MonorailConfiguration, MonorailTopology},
-//     };
+impl BridgeDropCancelGuard {}
 
-//     #[test]
-//     pub fn test_bridge_demultiplex() {
-//         MonorailTopology::setup(
-//             MonorailConfiguration::builder()
-//                 .with_core_override(2)
-//                 .build(),
-//             |init| {
-//                 spawn_async_task(async {
-//                     let (a, b) = Bridge::create_queues();
 
-//                     let (tx, rx) = oneshot::channel();
-//                     submit_task_to(ShardId::new(1), async move || {
-//                         let (c, d) = Bridge::create_queues();
-//                         let _ = tx.send(d);
 
-//                         let mut br2 = Bridge::create(c, b);
-//                         br2.run_bridge()
-//                             .await;
-//                     });
-//                     let d = rx.await.unwrap();
+#[cfg(test)]
+mod tests {
+    // use futures::channel::oneshot;
 
-//                     let mut br = Bridge::create(a, d);
+    use crate::core::{
+        // channels::bridge::Bridge,
+        shard::{
+            shard::{call_on, shard_id, signal_monorail, spawn_async_task},
+            state::{ShardId},
+        },
+        topology::{MonorailConfiguration, MonorailTopology},
+    };
 
-//                     // br.fire_and_forget(Box::new(async move |runtime| {
-//                     //     println!("hello");
-//                     // }));
-//                 })
-//                 .detach();
-//             },
-//         )
-//         .unwrap();
-//     }
+    #[test]
+    pub fn test_bridge_demultiplex() {
+        MonorailTopology::setup(
+            MonorailConfiguration::builder()
+                .with_core_override(2)
+                .build(),
+            async || {
+                spawn_async_task(async {
+                    let ru = call_on(ShardId::new(1), async move || shard_id())
+                        .await
+                        .unwrap();
+                    // println!("Hello...");
+
+                    assert_eq!(ru.as_usize(), 1);
+                    signal_monorail(Ok(()));
+                    // println!("RU: {:?}", ru);
+                })
+                .detach();
+            },
+        )
+        .unwrap();
+    }
+}
+
+// pub struct BridgeResolver {
+
 // }
 
-// // pub struct BridgeResolver {
+// fn test() {
 
-// // }
+//     let q: (Producer<'_, _>, heapless::spsc::Consumer<'_, _>) = Queue::<Task, 32>::new().split_const();
 
-// // fn test() {
-
-// //     let q: (Producer<'_, _>, heapless::spsc::Consumer<'_, _>) = Queue::<Task, 32>::new().split_const();
-
-// //     let b = Bridge {
-// //         send_queue: q.0,
-// //         recv_queue: q.1
-// //     };
-// // }
+//     let b = Bridge {
+//         send_queue: q.0,
+//         recv_queue: q.1
+//     };
+// }

@@ -232,7 +232,7 @@ impl<'a> Runner<'a> {
     // #[inline]
     // fn 
     pub async fn run<T>(&mut self) -> T {
-        let event_fd_poller = install_polladd_multi(&self.state.ring, unsafe {
+        let _event_fd_poller = install_polladd_multi(&self.state.ring, unsafe {
             (*self.state.long_wakeup).as_fd().as_raw_fd()
         })
         .unwrap();
@@ -275,7 +275,7 @@ impl<'a> Runner<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, rc::Rc, task::{Poll, Waker}};
+    use std::{future::Future, task::{Poll, Waker}};
 
     use flume::Sender;
     use smol::future::{self};

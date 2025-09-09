@@ -232,7 +232,7 @@ impl IoRingDriver {
 }
 
 mod sealed {
-    pub(crate) trait IoSeal {}
+    pub trait IoSeal {}
 }
 
 pub trait OwnedBuffer: IoSeal {
