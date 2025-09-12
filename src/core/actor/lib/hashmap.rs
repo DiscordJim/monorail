@@ -3,7 +3,7 @@ use std::{collections::HashMap, hash::{DefaultHasher, Hash, Hasher}, marker::Pha
 use anyhow::Result;
 use futures::channel::oneshot::{self, Sender};
 
-use crate::core::{actor::{base::{Actor, FornAddr}, routing::{Router, RouterArguments, RouterSpawnPolicy, RoutingPolicy}}, shard::shard::spawn_actor};
+use crate::core::{actor::{base::Actor, manager::Addr, routing::{Router, RouterArguments, RouterSpawnPolicy, RoutingPolicy}}, alloc::MonoHashMap, shard::shard::spawn_actor};
 
 
 pub struct ShardedHashMap<K, V>
@@ -11,7 +11,7 @@ where
     K: Send + Eq + Hash + 'static,
     V: Send + Clone + 'static
 {
-    addr: FornAddr<Router<HashMapShardActor<K, V>>>
+    addr: Addr<Router<HashMapShardActor<K, V>>>
 }
 
 impl<K, V> ShardedHashMap<K, V>
@@ -79,12 +79,12 @@ where
 {
     type Arguments = ();
     type Message = HashMapRequest<K, V>;
-    type State = HashMap<K, V>;
+    type State = MonoHashMap<K, V>;
     fn name() -> &'static str {
         ""
     }
     fn pre_start(_: Self::Arguments) -> anyhow::Result<Self::State> {
-        Ok(HashMap::new())
+        Ok(MonoHashMap::new())
     }
     async fn handle(
             _: crate::core::actor::base::SelfAddr<'_, Self>,

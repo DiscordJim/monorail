@@ -5,3 +5,4 @@ pub mod task;
 pub mod io;
 pub mod executor;
 pub mod actor;
+pub mod alloc;

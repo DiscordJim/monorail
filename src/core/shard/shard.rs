@@ -1,13 +1,13 @@
-use std::{any::Any, cell::UnsafeCell, future::Future};
+use std::{any::Any, cell::UnsafeCell, future::{poll_fn, Future}, panic::AssertUnwindSafe, pin::Pin, task::Poll};
 
 use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::{gettid, Pid},
 };
 
-use crate::core::{actor::base::{Actor, ActorSignal, Addr, FornAddr}, channels::{bridge::{Bridge, Rx, Tx}, promise::{PromiseError, SyncPromiseResolver}}, executor::mail::MailId, shard::{
+use crate::core::{actor::{base::{Actor, ActorSignal, LocalAddr}, manager::Addr}, channels::{bridge::{Bridge, Rx, Tx}, promise::{Promise, PromiseError, PromiseResolver, SyncPromiseResolver}}, shard::{
     error::ShardError,
-    state::{ShardConfigMsg, ShardCtx, ShardId, ShardMapTable},
+    state::{ShardConfigMsg, ShardCtx, ShardId, ShardMapTable, ShardRoute},
 }, topology::TopologicalInformation};
 use crate::core::
     channels::{Receiver, Sender}
@@ -87,13 +87,6 @@ where
     r.executor.spawn(future)
 }
 
-pub(crate) fn get_actor_addr<A>(addr: FornAddr<A>) -> Option<Addr<A>>
-where 
-    A: Actor
-{
-    let local = access_shard_ctx_ref();
-    local.executor.lookup_actor(addr)
-}
 
 // pub(crate) fn with_signal_handler<F>(addr: &FornAddr<A>) -> anyhow::Result<()>
 // where 
@@ -104,27 +97,39 @@ where
 
 // }
 
-#[inline]
-pub(crate) fn signal_actor_mailbox(addr: MailId, signal: ActorSignal) -> anyhow::Result<()> {
 
-    access_shard_ctx_ref().executor.signal_mailbox(addr, signal)?;
+// pub fn signal_actor_address
 
-    Ok(())
-}
 
-pub fn spawn_actor<A>(args: A::Arguments) -> anyhow::Result<(FornAddr<A>, Addr<A>)>
+
+pub fn spawn_actor<A>(args: A::Arguments) -> anyhow::Result<(Addr<A>, LocalAddr<A>)>
 where 
     A: Actor + 'static
 {
 
     let r = access_shard_ctx_ref();
-    let (faddr, addr) = r.executor.spawn_actor(args)?;
-    // r.
+    let address = r.actors.spawn_actor::<A>(&r.executor, args)?;
+    let local = address.clone().upgrade().map_err(|_| ()).expect("This must upgrade!");
 
-    Ok((faddr, addr))
+    Ok((address, local))
 
 
 }
+
+
+// pub(crate) fn spawn_actor_full<A>(args: A::Arguments) -> anyhow::Result<(Addr<A>, LocalAddr<A>)>
+// where 
+//     A: Actor + 'static
+// {
+
+//     let r = access_shard_ctx_ref();
+//     let address = r.actors.spawn_actor::<A>(&r.executor, args)?;
+//     let local = address.clone().upgrade().map_err(|_| ()).expect("This must upgrade!");
+
+//     Ok((address, local))
+
+
+// }
 
 // pub(crate) async fn spawn_local_task<'a>() {
 
@@ -174,9 +179,13 @@ where
 //     });
 // }
 
-pub(crate) fn get_remote_brige(origin: ShardId) -> &'static Bridge {
-    let ctx = access_shard_ctx_ref();
-    &ctx.table.table[origin.as_usize()]
+// pub(crate) fn get_remote_brige(origin: ShardId) -> &'static Bridge {
+//     let ctx = access_shard_ctx_ref();
+//     &ctx.table.table[origin.as_usize()]
+// }
+
+pub fn get_shard_route(core: ShardId) -> Option<&'static ShardRoute> {
+    access_shard_ctx_ref().table.table.get(core.as_usize())
 }
 
 pub async fn call_on<F, FUT, O>(core: ShardId, task: F) -> Result<O, PromiseError>
@@ -185,21 +194,79 @@ where
     FUT: Future<Output = O> + 'static,
     O: Send + 'static
 {
-    // let job: AsyncTaskWithResult = Box::new(|| Box::pin(async move {
-    //     let r = task().await;
-    //     Box::new(r) as Box<dyn Any + Send + 'static>
-    // }));
+    match &access_shard_ctx_ref().table.table[core.as_usize()] {
+        ShardRoute::Bridge(bridge) => {
 
-    let shot = access_shard_ctx_ref().table.table[core.as_usize()].fire_with_ticket(task).await?;
-
-    // let shot: Box<O> = shot.downcast().expect("Wrong return type?");
-
-    Ok(shot)
-
-    
-
-    // let bridged = Bridge
+            let shot = bridge.fire_with_ticket(task).await?;
+            Ok(shot)
+        }
+        ShardRoute::Loopback => {
+            call_on_local(task).await
+        }
+    }
 }
+
+use futures::FutureExt;
+
+
+#[pin_project::pin_project]
+struct LocalPromise<F, O> {
+    #[pin]
+    future: F,
+    resolver: Option<PromiseResolver<O>>
+}
+
+impl<F, O> Future for LocalPromise<F, O>
+where 
+    F: Future<Output = O>
+{
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| this.future.poll(cx))) {
+            Ok(poll) => match poll {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(o) => {
+                    
+                this.resolver.take().unwrap().resolve(o);
+                Poll::Ready(())
+            // }
+                }
+            }
+            Err(e) => {
+                this.resolver.take().unwrap().reject_panic(e);
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+#[inline]
+pub async fn call_on_local<F, FUT, O>(task: F) -> Result<O, PromiseError>
+where 
+    F: FnOnce() -> FUT + Send + 'static,
+    FUT: Future<Output = O> + 'static,
+    O: Send + 'static
+{
+    // let (rx, tx) = Promise::<O>::new();
+    match std::panic::catch_unwind(AssertUnwindSafe(|| task())) {
+        Ok(fut) => {
+            let (rx, tx) = Promise::<O>::new();
+
+            access_shard_ctx_ref()
+                .executor
+                .spawn(LocalPromise {
+                    future: fut,
+                    resolver: Some(tx)
+                }).detach();
+
+            rx.await
+            
+        }
+        Err(e) => Err(PromiseError::Paniced(e))
+    }
+}
+
 
 pub fn submit_to<F, FUT>(core: ShardId, task: F)
 where
@@ -210,13 +277,24 @@ where
 
     // let job = box_job(task);
 
-    ROUTING_TABLE
-        .with(|f: &UnsafeCell<Option<&'static ShardCtx>>| unsafe { &*f.get() }.unwrap())
-        .table
-        .table[core.as_usize()]
-        
-        .fire_and_forget(task);
-    println!("fired!");
+
+
+    match &access_shard_ctx_ref().table.table[core.as_usize()] {
+        ShardRoute::Bridge(bridge) => {
+
+            bridge.fire_and_forget(task);
+            // Ok(shot)
+        }
+        ShardRoute::Loopback => {
+//
+            // let fut= task();
+            access_shard_ctx_ref()
+                .executor
+                .spawn(task()).detach();
+            // Err(PromiseError::PromiseClosed)
+        }
+    }
+    // println!("fired!");
 }
 
 pub fn get_topology_info() -> &'static TopologicalInformation {
@@ -232,7 +310,7 @@ fn perform_core_bind(
     core_count: usize,
     config_rx: Receiver<ShardConfigMsg>,
 ) -> Result<(), ShardError> {
-    let (table, notifier) = configure_shard(core, core_count, config_rx)?;
+    let ShardInitCtx { table, resolver, seed } = configure_shard(core, core_count, config_rx)?;
 
     // println!("Configuration done for core: {core:?}");
 
@@ -241,7 +319,7 @@ fn perform_core_bind(
     // SHARD_CTX.with(|f| unsafe { *f.get() =  Some(&context) } );
     ROUTING_TABLE.with(|f| unsafe { *f.get() = Some(context) });
 
-    configure_shard_executor(context, notifier);
+    configure_shard_executor(context,  resolver, seed);
 
     Ok(())
 }
@@ -262,6 +340,7 @@ fn perform_core_bind(
 fn configure_shard_executor(
     ctx: &'static ShardCtx,
     notifier: SyncPromiseResolver<()>,
+    seeder: Option<ShardSeedFn>
 ) {
     // let mut runtime = Rc::new(UnsafeCell::new(ShardRuntime::new(core)));
     // let executor = LocalExecutor::new().leak();
@@ -270,30 +349,20 @@ fn configure_shard_executor(
 
     smol::future::block_on(ctx.executor.run(async move {
 
+        if let Some(functor) = seeder {
+            println!("Has a seeder.");
+            ctx.executor.spawn(functor()).detach();
+        }
 
         for bridge in &ctx.table.table {
-            ctx.executor.spawn(async move {
+            if let ShardRoute::Bridge(bridge) = bridge {
+                 ctx.executor.spawn(async move {
                 // println!("spawning bridge. ({:?})", shard_id());
                 bridge.run_bridge().await;
             }).detach();
+            }
+           
         }
-
-        // for recvr in rcvers {
-        //     let rcvr = Box::leak(Box::new(recvr));
-        //     let runtime2 = runtime.clone();
-        //     ctx.executor.spawn(async move {
-        //         let runtime2 = unsafe { &mut *runtime2.get() };
-        //         loop {
-        //             // println!("WAITING>..");
-        //             let task = rcvr.recv_async().await.unwrap();
-        //             // println!("GOT A TASK...");
-        //             // task(runtime2);
-        //             monorail_unwind_guard(|| task(runtime2));
-        //         }
-        //     }).detach();
-
-        // }
-
 
         let _ = notifier.resolve(());
         smol::future::pending::<()>().await;
@@ -302,11 +371,19 @@ fn configure_shard_executor(
     
 }
 
+pub type ShardSeedFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + Send + 'static>;
+
+struct ShardInitCtx {
+    table: ShardMapTable,
+    resolver: SyncPromiseResolver<()>,
+    seed: Option<ShardSeedFn>
+}
+
 fn configure_shard(
     core: ShardId,
     total_cores: usize,
     config_rx: Receiver<ShardConfigMsg>,
-) -> Result<(ShardMapTable, SyncPromiseResolver<()>), ShardError> {
+) -> Result<ShardInitCtx, ShardError> {
 
 
     let mut producers = vec![];
@@ -328,6 +405,7 @@ fn configure_shard(
     // }
 
 
+    let mut seeder = None;
     // let shard_recievers = Vec::with_capacity(total_cores);
     let mut notifier = None;
     let table = ShardMapTable::initialize(total_cores, |rt| {
@@ -335,15 +413,7 @@ fn configure_shard(
             match config_rx.recv() {
                 Ok(msg) => match msg {
                     ShardConfigMsg::ConfigureExternalShard { target_core, consumer } => {
-                        // producers[target_core.as_usize()] = Some(from_receiver);
-
                         producers[target_core.as_usize()] = Some(consumer);
-
-
-
-                        // producers_rx[]
-                        // consumers_tx[target_core.as_usize()] = Some(rx_consumer);
-                        // producers_rx[target_core.as_usize()] = Some(tx_producer);
                     }
                     ShardConfigMsg::StartConfiguration {
                         requester,
@@ -351,13 +421,7 @@ fn configure_shard(
                     } => {
 
                         let (tx_producer, tx_consumer) = Bridge::create_queues::<Rx, Tx>();
-                        // let (rx_producer, rx_consumer) = Bridge::create_queues();
-
-                        // producers[requester.as_usize()] = Some(tx_producer);
-                        // consumers_rx[requester.as_usize()] = Some(rx_consumer);
-
                         consumers[requester.as_usize()] = Some(tx_consumer);
-
                         queue.resolve(tx_producer);
 
                         // producers[requester.as_usize()] = Some(producer);
@@ -369,15 +433,26 @@ fn configure_shard(
                         // shard_recievers.push(rx);
                         // queue.resolve(tx);
                     }
+                    ShardConfigMsg::Seed(seedr) => {
+                        seeder = Some(seedr);
+                    }
                     ShardConfigMsg::FinalizeConfiguration(tx) => {
 
                         // let tx = producers_rx.into_iter().map(Option::unwrap).zip(consumers.into_iter().map(Option::unwrap)).collect::<Vec<_>>();
                         // let rx = producers.into_iter().map(Option::unwrap).zip(consumers_rx.into_iter().map(Option::unwrap)).collect::<Vec<_>>();
 
+                        // producers[core.as_usize()] = 
 
-                        let mut channels = producers.into_iter().map(Option::unwrap).zip(consumers.into_iter().map(Option::unwrap)).map(|(producer, consumer)| {
-                            Bridge::create(producer, consumer)
-                        }).collect::<Vec<_>>();
+                        let mut channels: Vec<ShardRoute> = vec![];
+                        for i in 0..producers.len() {
+                            if i == core.as_usize() {
+                                // println!("That's me!");
+                                channels.push(ShardRoute::Loopback);
+                            } else {
+                                channels.push(ShardRoute::Bridge(Bridge::create(producers[i].take().unwrap(), consumers[i].take().unwrap())));
+                            }
+                            println!("Loading {i}...");
+                        }
                         
                         // for i in 0..channels.len() {
                         //     rt[i] = Some(channels[i]);
@@ -404,6 +479,10 @@ fn configure_shard(
 
     // println!("Shard {core:?} is terminating...");
 
-    Ok((table, notifier.unwrap()))
+    Ok(ShardInitCtx {
+        resolver: notifier.ok_or_else(|| ShardError::ConfigFailure(core))?,
+        seed: seeder,
+        table: table
+    })
 }
 

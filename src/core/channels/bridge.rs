@@ -19,9 +19,9 @@ use slab::Slab;
 use crate::core::{
     channels::promise::{Promise, PromiseError, PromiseResolver},
     shard::{
-        shard::{access_shard_ctx_ref, get_remote_brige, shard_id, submit_to},
-        state::ShardId,
-    }, task::{TaskControlBlock, TaskControlBlockVTable, TaskControlHeader, TcbInit, TcbResult},
+        shard::{access_shard_ctx_ref, get_shard_route, shard_id, submit_to},
+        state::{ShardId, ShardRoute},
+    }, task::{CrossCoreTcb, Init, Ready, TaskControlBlock, TaskControlBlockVTable, TaskControlHeader},
 };
 
 
@@ -37,13 +37,15 @@ use crate::core::{
 
 // struct Br/
 
-pub type BridgeMessage = TaskControlBlockVTable<TcbInit>;
+pub type BridgeMessage = CrossCoreTcb<Init>;
 
 pub struct Tx;
 pub struct Rx;
 
+
+
 pub struct BridgeProducer<M> {
-    queue: Producer<'static, TaskControlBlockVTable<TcbInit>>,
+    queue: Producer<'static, CrossCoreTcb<Init>>,
     waker: BridgeWakeCtx, // waker: Arc<AtomicPtr<Waker>>
     _marker: PhantomData<M>,
 }
@@ -54,7 +56,7 @@ pub struct BridgeProducer<M> {
 // }
 
 pub struct BridgeConsumer<M> {
-    queue: Consumer<'static, TaskControlBlockVTable<TcbInit>>,
+    queue: Consumer<'static, CrossCoreTcb<Init>>,
     waker: BridgeWakeCtx,
     _marker: PhantomData<M>,
 }
@@ -64,7 +66,7 @@ pub(crate) struct BridgeConsumerFut<'a, M> {
 }
 
 impl<'a, M> Future for BridgeConsumerFut<'a, M> {
-    type Output = TaskControlBlockVTable<TcbInit>;
+    type Output = CrossCoreTcb<Init>;
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -88,7 +90,7 @@ impl<M> BridgeConsumer<M> {
 }
 
 impl<M> BridgeProducer<M> {
-    pub fn send(&mut self, task: TaskControlBlockVTable<TcbInit>) -> Result<(), TaskControlBlockVTable<TcbInit>> {
+    pub fn send(&mut self, task: CrossCoreTcb<Init>) -> Result<(), CrossCoreTcb<Init>> {
         self.queue
             .enqueue(task)?;
         self.waker.wake_by_ref();
@@ -138,13 +140,17 @@ impl BridgeWakeCtx {
 pub struct Bridge {
     send_queue: RefCell<BridgeProducer<Rx>>,
     recv_queue: RefCell<BridgeConsumer<Tx>>,
-    back_log: Vec<TaskControlBlockVTable<TcbInit>>,
-    arena: RefCell<Slab<PromiseResolver<TaskControlBlockVTable<TcbResult>>>>,
+    back_log: Vec<CrossCoreTcb<Init>>,
+    arena: RefCell<Slab<PromiseResolver<CrossCoreTcb<Ready>>>>,
 }
+
+// pub struct BridgeDeck {
+    
+// }
 
 impl Bridge {
     pub fn create_queues<A, B>() -> (BridgeProducer<A>, BridgeConsumer<B>) {
-        let queue = Box::leak(Box::new(Queue::<TaskControlBlockVTable<TcbInit>, 128>::new()));
+        let queue = Box::leak(Box::new(Queue::<CrossCoreTcb<Init>, 128>::new()));
         // Producer::
         let (producer, consumer) = queue.split();
 
@@ -191,7 +197,7 @@ impl Bridge {
         FUT: Future<Output = ()> + 'static
     {
 
-        let block = TaskControlBlock::create(TaskControlHeader::FireAndForget, task);
+        let block = CrossCoreTcb::build(TaskControlHeader::FireAndForget, task);
 
 
         let _ = self
@@ -211,7 +217,7 @@ impl Bridge {
 
         let (rx, tx) = Promise::new();
         let ticket_id = self.arena.borrow_mut().insert(tx);
-        let block = TaskControlBlock::create(TaskControlHeader::WithReturn {
+        let block = CrossCoreTcb::build(TaskControlHeader::WithReturn {
             origin: shard_id(),
             ticket: ticket_id
         }, task);
@@ -221,7 +227,7 @@ impl Bridge {
             .borrow_mut()
             .send(block);
 
-        let payload = unsafe { rx.await?.get_result::<O>() };
+        let payload = unsafe { rx.await?.extract::<O>() };
 
         Ok(payload)
     }
@@ -261,17 +267,23 @@ impl Bridge {
 
                                
                                 // println!("Done (B)");
+                                // if let Some(bridge) = get_shard_route(current) {
+                                //     submit_to(source, async move || {});
+                                // }
                                 submit_to(source, async move || {
-                                    let bridge = get_remote_brige(current);
-
-                                    match reso {
+                                    // if let ShardRoute::Bridge(bridge) = 
+                                    if let Some(ShardRoute::Bridge(bridge)) = get_shard_route(current) {
+                                        match reso {
                                         Err(e) => {
-                                            let _ = bridge.arena.borrow_mut().remove(ticket_id).reject_panic(e.get_panic());
+                                            let _ = bridge.arena.borrow_mut().remove(ticket_id).reject_panic(e);
                                         }
                                         Ok(v) => {
                                             let _ = bridge.arena.borrow_mut().remove(ticket_id).resolve(v);
                                         }
                                     }
+                                    }
+                                    
+                                 
 
                                     // let _ =
                                     //     bridge.arena.borrow_mut().remove(ticket_id).resolve(reso);
@@ -309,8 +321,11 @@ impl Drop for BridgeDropCancelGuard {
         let current = self.current;
         let slot = self.slot;
         submit_to(origin, async move || {
-            let bridge = get_remote_brige(current);
-            let _ = bridge.arena.borrow_mut().remove(slot);
+            if let Some(ShardRoute::Bridge(bridge)) = get_shard_route(current) {
+                let _ = bridge.arena.borrow_mut().remove(slot);
+            }
+            // let bridge = get_remote_brige(current);
+            
         });
     }
 }

@@ -1,9 +1,12 @@
+use std::cell::RefCell;
 use std::marker::PhantomData;
 
 
+use crate::core::actor::manager::ThreadActorManager;
 use crate::core::channels::bridge::{Bridge, BridgeConsumer, BridgeProducer, Rx, Tx};
 use crate::core::channels::promise::SyncPromiseResolver;
 use crate::core::executor::scheduler::Executor;
+use crate::core::shard::shard::ShardSeedFn;
 use crate::core::topology::TopologicalInformation;
 use crate::core::{shard::error::ShardError};
 use crate::core::channels::Sender;
@@ -27,6 +30,7 @@ pub struct ShardCtx {
     pub table: ShardMapTable,
     pub top_info: TopologicalInformation,
     pub executor: Executor<'static>,
+    pub actors: ThreadActorManager,
     _unsend: PhantomData<*const ()>
 }
 
@@ -37,6 +41,7 @@ impl ShardCtx {
             table,
             top_info: info,
             executor: Executor::new(core),
+            actors: ThreadActorManager::new(core).into(),
             _unsend: PhantomData
         }
     }
@@ -58,16 +63,20 @@ impl ShardCtx {
 // }
 
 pub struct ShardMapTable {
-    pub table: Box<[Bridge]>
+    pub table: Box<[ShardRoute]>
 }
 
-
+pub(crate) enum ShardRoute {
+    /// This shard points to a bridge.
+    Bridge(Bridge),
+    Loopback
+}
 
 
 impl ShardMapTable {
     pub(crate) fn initialize<F>(cores: usize, functor: F) -> Result<Self, ShardError>
     where 
-        F: FnOnce(&mut [Option<Bridge>]) -> Result<(), ShardError>
+        F: FnOnce(&mut [Option<ShardRoute>]) -> Result<(), ShardError>
     {
 
         let mut array = Vec::with_capacity(cores);
@@ -104,5 +113,6 @@ pub(crate) enum ShardConfigMsg {
         /// and the second item is the producer for sending.
         queue: SyncPromiseResolver<BridgeProducer<Rx>>
     },
+    Seed(ShardSeedFn),
     FinalizeConfiguration(SyncPromiseResolver<()>)
 }

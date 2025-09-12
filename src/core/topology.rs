@@ -6,7 +6,7 @@ use crate::core::{
     channels::promise::SyncPromise,
     shard::{
         error::ShardError,
-        shard::{access_shard_ctx_ref, setup_shard, signal_monorail, MONITOR},
+        shard::{access_shard_ctx_ref, setup_shard, signal_monorail, ShardSeedFn, MONITOR},
         state::{ShardConfigMsg, ShardId},
     },
     task::{self, Task, TaskControlBlock, TaskControlHeader},
@@ -66,14 +66,22 @@ impl MonorailTopology {
     }
 }
 
-fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError> {
-    let mut seed_queue = None;
+fn setup_basic_topology(core_count: usize, seeder: Option<ShardSeedFn>) -> Result<(), TopologyError> {
+    // let mut seed_queue = None;
     let configurations = (0..core_count)
         .map(|i| setup_shard(ShardId::new(i), core_count))
         .collect::<Result<Vec<_>, ShardError>>()?;
     println!("We are configuring {core_count} shards with only {} cores.", num_cpus::get());
+    
+    if let Some(seed_fn) = seeder {
+        configurations[0].send(ShardConfigMsg::Seed(seed_fn)).unwrap();
+    }
+    
     for x in 0..core_count {
         for y in 0..core_count {
+            if x == y {
+                continue;
+            }
             let (tx, rx) = SyncPromise::new();
             configurations[y]
                 .send(ShardConfigMsg::StartConfiguration {
@@ -82,28 +90,29 @@ fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError
 
                 })
                 .map_err(|_| TopologyError::ShardClosedPrematurely)?;
-            let mut queue = tx
+            let queue = tx
                 .wait()
                 .map_err(|_| TopologyError::ShardClosedPrematurely)?;
-            if x == 0 && y == 0 {
-                let (seed_tx, seed_rx) = flume::unbounded();
+            // if x == 0 && y == 0 {
+            //     let (seed_tx, seed_rx) = flume::unbounded();
 
-                println!("bringing da queue...");
-                let initial = TaskControlBlock::create(TaskControlHeader::FireAndForget, async move || {
-                    println!("Erm... {:?}", seed_rx.len());
-                    let task: Box<dyn FnOnce() + Send + 'static>  = seed_rx.recv_async().await.unwrap();
-                    task();
-                });
-                let _ = queue.send(initial);
-                println!("Sent a seed task.");
+            //     println!("bringing da queue...");
+            //     let initial = TaskControlBlock::create(TaskControlHeader::FireAndForget, async move || {
+            //         println!("Erm... {:?}", seed_rx.len());
+            //         let task: Box<dyn FnOnce() + Send + 'static>  = seed_rx.recv_async().await.unwrap();
+            //         task();
+            //     });
+            //     let _ = queue.send(initial);
+            //     println!("Sent a seed task.");
 
-                // let _ = queue.send(BridgedTask::FireAndForget(box_job(async move || {
-                //     let task: Box<dyn FnOnce() + Send + 'static> = seed_rx.recv_async().await.unwrap();
+            //     // let _ = queue.send(BridgedTask::FireAndForget(box_job(async move || {
+            //     //     let task: Box<dyn FnOnce() + Send + 'static> = seed_rx.recv_async().await.unwrap();
                     
-                //     task();
-                // })));
-                seed_queue = Some(seed_tx);
-            }
+            //     //     task();
+            //     // })));
+            //     i
+            //     seed_queue = Some(seed_tx);
+            // }
 
             configurations[x]
                 .send(ShardConfigMsg::ConfigureExternalShard {
@@ -115,7 +124,7 @@ fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError
         }
     }
 
-    for x in 0..core_count {
+    for x in (0..core_count).rev() {
         let (tx, rx) = SyncPromise::new();
         configurations[x]
             .send(ShardConfigMsg::FinalizeConfiguration(rx))
@@ -125,7 +134,7 @@ fn setup_basic_topology(core_count: usize) -> Result<Sender<Task>, TopologyError
             .map_err(|_| TopologyError::ShardClosedPrematurely)?;
     }
 
-    Ok(seed_queue.unwrap())
+    Ok(())
 }
 
 fn launch_topology<T, F>(core_count: usize, seeder_function: T) -> Result<(), TopologyError>
@@ -136,19 +145,27 @@ where
     let (promise, resolver) = SyncPromise::<Result<(), Box<dyn Any + Send + 'static>>>::new();
     // std::mem::forget(resolver);
     // println!("Resolover ready...");
-    let seeder = setup_basic_topology(core_count)?;
-    // println!("Set up...");
-    seeder
-        .send(Box::new(|| {
-            // println!("hello");
-
-            MONITOR.with(|f| {
+    setup_basic_topology(core_count, Some(Box::new(|| {
+        MONITOR.with(|f| {
                 unsafe { *(&mut *f.get()) = Some(resolver); }
             });
 
-            access_shard_ctx_ref().executor.spawn(seeder_function()).detach();
-        }))
-        .map_err(|_| TopologyError::SeedFailure)?;
+        Box::pin(seeder_function())
+    })))?;
+
+    println!("Done setup.");
+    // // println!("Set up...");
+    // seeder
+    //     .send(Box::new(|| {
+    //         // println!("hello");
+
+    //         MONITOR.with(|f| {
+    //             unsafe { *(&mut *f.get()) = Some(resolver); }
+    //         });
+
+    //         access_shard_ctx_ref().executor.spawn(seeder_function()).detach();
+    //     }))
+    //     .map_err(|_| TopologyError::SeedFailure)?;
 
     promise.wait().unwrap().unwrap();
 
@@ -273,5 +290,35 @@ mod tests {
         }
 
         assert_eq!(&*MERRY_GO_ROUND.lock().unwrap(), &ar);
+    }
+
+    #[test]
+    pub fn test_self_signal_msg() {
+        MonorailTopology::setup(MonorailConfiguration::builder().build(), async || {
+  
+
+            monolib::submit_to(shard_id(), async || {
+                signal_monorail(Ok(()));
+            });
+
+        }).unwrap();
+    }
+
+    #[test]
+    pub fn test_self_signal() {
+        MonorailTopology::setup(MonorailConfiguration::builder().build(), async || {
+
+            println!("hello!");
+
+            
+
+            let wow = monolib::call_on(shard_id(), async || {
+                3
+            }).await.unwrap();
+            assert_eq!(wow, 3);
+
+            signal_monorail(Ok(()));
+
+        }).unwrap();
     }
 }

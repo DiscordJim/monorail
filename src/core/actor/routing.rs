@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use anyhow::anyhow;
 
 use crate::core::{
-    actor::base::{Actor, ActorCall, Addr, FornAddr},
+    actor::{base::{Actor, ActorCall, LocalAddr}, manager::Addr},
     shard::{shard::get_topology_info, state::ShardId},
 };
 
@@ -11,8 +11,7 @@ pub struct Router<A>
 where
     A: Actor,
 {
-    // routing_table: Vec<>
-    _marker: PhantomData<A>,
+    _marker: PhantomData<A>
 }
 
 
@@ -33,7 +32,7 @@ where
     A: Actor,
     Router<A>: Actor
 {
-    targets: Vec<FornAddr<A>>,
+    targets: Vec<Addr<A>>,
     last_shot: usize,
     arguments: RouterArguments<A>,
     _marker: PhantomData<A>,

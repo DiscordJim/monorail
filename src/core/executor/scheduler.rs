@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::core::{
-    actor::base::{Actor, ActorSignal, Addr, FornAddr}, executor::{backoff::{AdaptiveBackoff, BackoffResult}, mail::{MailId, ShardActorOffice}}, io::{fs::OpenOptions, ring::{install_polladd_multi, install_timeout, timeout, Claim, IoRingDriver}, FromRing}, shard::state::ShardId
+    actor::base::{Actor, ActorSignal, LocalAddr}, executor::{backoff::{AdaptiveBackoff, BackoffResult}}, io::{fs::OpenOptions, ring::{install_polladd_multi, install_timeout, timeout, Claim, IoRingDriver}, FromRing}, shard::state::ShardId
 };
 use async_task::{Builder, Runnable};
 use io_uring::{squeue::PushError, types::Timespec};
@@ -34,8 +34,6 @@ impl<'a> Executor<'a> {
 }
 
 struct ExecutorState {
-    id: ShardId,
-    office: RefCell<ShardActorOffice>,
     queue: RefCell<VecDeque<Runnable>>,
     // fast_queue: Bo
     mt_queue: UnboundedQueue<Runnable>,
@@ -64,8 +62,7 @@ impl<'a> Executor<'a> {
 
         let obj = Self {
             state: ExecutorState {
-                id: core,
-                office: ShardActorOffice::new().into(),
+                // office: ShardActorOffice::new().into(),
                 queue: RefCell::default(),
                 mt_queue: UnboundedQueue::new(),
                 // token: GhostToken::new(|token| token),
@@ -86,33 +83,6 @@ impl<'a> Executor<'a> {
     pub fn io_uring(&'a self) -> &'a IoRingDriver {
         &self.state.ring
     }
-
-    // pub(crate) fn with_signal_handler<F>(&self, addr: &FornAddr<A>, ) {
-
-    //     self.state.office.borrow().
-
-    // }
-
-
-    pub(crate) fn signal_mailbox(&self, addr: MailId, signal: ActorSignal) -> anyhow::Result<()> {
-        self.state.office.borrow().signal_address(addr, signal)
-    }
-
-    pub(crate) fn lookup_actor<A>(&self, addr: FornAddr<A>) -> Option<Addr<A>>
-    where 
-        A: Actor
-    {
-        self.state.office.borrow().lookup_address::<A>(addr.signal.mail)
-
-    }
-
-    pub fn spawn_actor<A>(&'static self, arguments: A::Arguments) -> anyhow::Result<(FornAddr<A>, Addr<A>)>
-    where 
-        A: Actor + 'static,
-        // A::Arguments: 'a
-    {
-        self.state.office.borrow_mut().spawn_actor(self.state.id, self, arguments)
-    }
     
 
     pub(crate) fn spawn<T: 'a>(&'a self, future: impl Future<Output = T> + 'a) -> Task<T> {
@@ -128,6 +98,7 @@ impl<'a> Executor<'a> {
                         // println!("Pushing task...");
 
                         if current().id() == origin {
+                            // println!("hehe 2");
                             self.state.push_task(runnable);
                         } else {
                             // println!("Landing in the MT quuee...");
@@ -145,13 +116,6 @@ impl<'a> Executor<'a> {
                         // self.state.notify();
                     },
                 );
-            // .spawn_unchecked(|()| future, |runnable| {
-            //     println!("Pushing task....");
-            //     self.state.push_task(runnable);
-            //     self.state.notify();
-            //     println!("Scheduled...");
-            // });
-
             runnable.schedule();
             task
         }
@@ -227,7 +191,9 @@ impl<'a> Runner<'a> {
     #[inline]
     fn schedule_runnable(&mut self, runnable: Runnable) {
         self.backoff.reset();
+        // println!("Starting run...");
         runnable.run();
+        // println!("Finsihed run...");
     }
     // #[inline]
     // fn 
@@ -253,6 +219,7 @@ impl<'a> Runner<'a> {
 
             for _ in 0..6 {
                 let runnable = self.state.pop_task();
+            
                 match runnable {
                     Some(runner) => self.schedule_runnable(runner),
                     None => break
@@ -266,6 +233,7 @@ impl<'a> Runner<'a> {
                     None => break
                 }
             }
+            // println!("Yi");
             yield_now().await;
         }
     }

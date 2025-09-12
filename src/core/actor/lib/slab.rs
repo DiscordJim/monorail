@@ -4,7 +4,7 @@ use anyhow::Result;
 use futures::channel::oneshot::{self, Sender};
 use slab::Slab;
 
-use crate::core::{actor::{base::{Actor, FornAddr}, routing::{Router, RouterArguments, RouterSpawnPolicy, RoutingPolicy}}, shard::shard::spawn_actor};
+use crate::core::{actor::{base::Actor, manager::Addr, routing::{Router, RouterArguments, RouterSpawnPolicy, RoutingPolicy}}, shard::shard::spawn_actor};
 
 
 pub struct ShardedSlab<V>
@@ -12,7 +12,7 @@ where
     // K: Send + Eq + Hash + 'static,
     V: Send + Clone + 'static
 {
-    addr: FornAddr<Router<ShardedSlabActor<V>>>
+    addr: Addr<Router<ShardedSlabActor<V>>>
 }
 
 impl<V> ShardedSlab<V>

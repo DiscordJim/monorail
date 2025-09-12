@@ -1,11 +1,5 @@
 use std::{
-    any::Any,
-    future::Future,
-    marker::PhantomData,
-    mem::MaybeUninit,
-    panic::AssertUnwindSafe,
-    pin::Pin,
-    task::{Context, Poll},
+    any::Any, cell::UnsafeCell, future::Future, marker::PhantomData, mem::MaybeUninit, panic::AssertUnwindSafe, pin::Pin, task::{Context, Poll}
 };
 
 use crate::core::shard::state::ShardId;
@@ -17,38 +11,38 @@ pub enum TaskControlHeader {
     WithReturn { origin: ShardId, ticket: usize },
 }
 
-pub struct TcbInit;
-pub struct TcbFuture;
+pub struct Init;
+pub struct Pollable<'a>(PhantomData<&'a ()>);
 
-pub struct TcbUnwind;
-pub struct TcbResult;
+pub struct Panicked;
+pub struct Ready;
 
 #[repr(C)]
-pub struct TaskControlBlock<T, F, O> {
+pub struct TaskControlBlock<T, A, F, O> {
     header: TaskControlHeader,
     allocation: TaskAllocation<T, F, O>,
-    // _marker: PhantomData<M>
+    _marker: PhantomData<A>
 }
 
 #[inline]
-unsafe fn task_read_future<'a, T, F, O>(ptr: *const ()) -> &'a mut TaskControlBlock<T, F, O>
+unsafe fn task_read_future<'a, T, A: 'a, F, O>(ptr: *const ()) -> &'a mut TaskControlBlock<T, A, F, O>
 where
-    T: FnOnce() -> F + Send + 'static,
-    F: Future<Output = O> + 'static,
-    O: Send + 'static,
+    T: FnOnce(&'a mut A) -> F + 'static,
+    F: Future<Output = O> + 'a,
+    O: 'a,
 {
     unsafe { &mut *ptr.cast_mut().cast() }
 }
 
 // #[inline]
-fn task_poll<T, F, O>(ptr: *const (), ctx: &mut Context<'_>) -> (Poll<()>, bool)
+fn task_poll<'a, T, A: 'a, F, O>(ptr: *const (), ctx: &mut Context<'_>) -> (Poll<()>, bool)
 where
-    T: FnOnce() -> F + Send + 'static,
-    F: Future<Output = O> + 'static,
-    O: Send + 'static,
+    T: FnOnce(&'a mut A) -> F + 'static,
+    F: Future<Output = O> + 'a,
+    O: 'a,
 {
     unsafe {
-        let future = task_read_future::<T, F, O>(ptr);
+        let future = task_read_future::<T, A, F, O>(ptr);
 
         let TaskAllocation::Future(o) = &mut future.allocation else {
             panic!("not fut.");
@@ -79,15 +73,15 @@ where
 }
 
 // #[inline]
-fn task_move_result<T, F, O>(ptr: *const (), slot: *mut MaybeUninit<()>, is_panic: bool)
+fn task_move_result<'a, T, A: 'a, F, O>(ptr: *const (), slot: *mut MaybeUninit<()>, is_panic: bool)
 where
-    T: FnOnce() -> F + Send + 'static,
-    F: Future<Output = O> + 'static,
-    O: Send + 'static,
+    T: FnOnce(&'a mut A) -> F + 'static,
+    F: Future<Output = O> + 'a,
+    O: 'a,
 {
     unsafe {
         if is_panic {
-            let future = task_read_future::<T, F, O>(ptr);
+            let future = task_read_future::<T, A, F, O>(ptr);
             let sl = std::mem::replace(&mut future.allocation, TaskAllocation::Empty);
             let TaskAllocation::Panic(o) = sl else {
                 panic!("R")
@@ -95,7 +89,7 @@ where
 
             (&mut *slot.cast::<MaybeUninit<Box<dyn Any + Send + 'static>>>()).write(o);
         } else {
-            let future = task_read_future::<T, F, O>(ptr);
+            let future = task_read_future::<T, A, F, O>(ptr);
             let sl = std::mem::replace(&mut future.allocation, TaskAllocation::Empty);
             let TaskAllocation::Result(o) = sl else {
                 panic!("R")
@@ -107,33 +101,35 @@ where
 }
 
 // #[inline]
-fn task_control_drop<T, F, O>(ptr: *const ())
+fn task_control_drop<'a, T, A: 'a, F, O>(ptr: *const ())
 where
-    T: FnOnce() -> F + Send + 'static,
-    F: Future<Output = O> + 'static,
-    O: Send + 'static,
+    T: FnOnce(&'a mut A) -> F + 'static,
+    F: Future<Output = O> + 'a,
+    O: 'a,
 {
     unsafe {
-        let _ = Box::<TaskControlBlock<T, F, O>>::from_raw(ptr.cast_mut().cast());
+        let _ = Box::<TaskControlBlock<T, A, F, O>>::from_raw(ptr.cast_mut().cast());
     }
 }
 
 // #[inline]
-fn task_execute<T, F, O>(ptr: *const ()) -> bool
+fn task_execute<'a, T, A: 'a, F, O>(ptr: *const (), args: *const ()) -> bool
 where
-    T: FnOnce() -> F + Send + 'static,
-    F: Future<Output = O> + 'static,
-    O: Send + 'static,
+    T: FnOnce(&'a mut A) -> F + 'static,
+    F: Future<Output = O> + 'a,
+    O: 'a,
 {
     unsafe {
-        let mandrop = task_read_future::<T, F, O>(ptr);
+        let mandrop = task_read_future::<T, A, F, O>(ptr);
         let TaskAllocation::Functor(func) =
             std::mem::replace(&mut mandrop.allocation, TaskAllocation::Empty)
         else {
             panic!("Failed to remove the functor.");
         };
 
-        match std::panic::catch_unwind(AssertUnwindSafe(|| func())) {
+        let arg_ref = &mut *args.cast_mut().cast::<A>();
+
+        match std::panic::catch_unwind(AssertUnwindSafe(|| func(arg_ref))) {
             Ok(a) => {
                 mandrop.allocation = TaskAllocation::Future(a);
                 true
@@ -146,32 +142,95 @@ where
     }
 }
 
-impl<T, FUT, O> TaskControlBlock<T, FUT, O>
+impl<'a, T, A: 'a, FUT, O> TaskControlBlock<T, A, FUT, O>
 where
-    T: FnOnce() -> FUT + Send + 'static,
-    FUT: Future<Output = O> + 'static,
-    O: Send + 'static,
+    T: FnOnce(&'a mut A) -> FUT + 'static,
+    FUT: Future<Output = O> + 'a,
+    O: 'static,
 {
-    pub(crate) fn create(header: TaskControlHeader, functor: T) -> TaskControlBlockVTable<TcbInit> {
+    pub(crate) fn create_local(header: TaskControlHeader, functor: T) -> TaskControlBlockVTable<Init> {
         let block = Box::new(TaskControlBlock {
             header,
             allocation: TaskAllocation::<T, FUT, O>::Functor(functor),
+            _marker: PhantomData::<A>
         });
 
         TaskControlBlockVTable {
             payload: Box::into_raw(block).cast(),
             // read_header: |payload|
-            drop: |payload| task_control_drop::<T, FUT, O>(payload),
-            run: |payload| task_execute::<T, FUT, O>(payload),
+            drop: |payload| task_control_drop::<T, A, FUT, O>(payload),
+            run: |payload, args| task_execute::<T, A, FUT, O>(payload, args),
             move_result: |payload, slot, is_panic| {
-                task_move_result::<T, FUT, O>(payload, slot, is_panic)
+                task_move_result::<T, A, FUT, O>(payload, slot, is_panic)
             },
-            poll: |payload, ctx| task_poll::<T, FUT, O>(payload, ctx),
+            poll: |payload, ctx| task_poll::<T, A, FUT, O>(payload, ctx),
             owns: true,
             _state: PhantomData,
         }
     }
+    
     // pub fn run(self) ->
+}
+
+impl<T, FUT, O> TaskControlBlock<T, (), FUT, O>
+where
+    T: FnOnce(&mut ()) -> FUT + Send + 'static,
+    FUT: Future<Output = O> + 'static,
+    O: Send + 'static,
+{
+    pub(crate) fn create(header: TaskControlHeader, functor: T) -> TaskControlBlockVTable<Init> {
+        let block = Box::new(TaskControlBlock {
+            header,
+            allocation: TaskAllocation::<T, FUT, O>::Functor(functor),
+            _marker: PhantomData::<()>
+        });
+
+        TaskControlBlockVTable {
+            payload: Box::into_raw(block).cast(),
+            // read_header: |payload|
+            drop: |payload| task_control_drop::<T, (),  FUT, O>(payload),
+            run: |payload, args| task_execute::<T, (), FUT, O>(payload, args),
+            move_result: |payload, slot, is_panic| {
+                task_move_result::<T, (), FUT, O>(payload, slot, is_panic)
+            },
+            poll: |payload, ctx| task_poll::<T, (), FUT, O>(payload, ctx),
+            owns: true,
+            _state: PhantomData,
+        }
+    }
+    
+    // pub fn run(self) ->
+}
+
+pub(crate) unsafe fn build_tcb_vtable<'a, T, A, F, O>(
+    header: TaskControlHeader,
+    task: T
+) -> TaskControlBlockVTable<Init>
+where 
+    T: FnOnce(&'a mut A) -> F + 'static,
+    A: 'a,
+    F: Future<Output = O> + 'a,
+    O: 'a
+{
+    let block = Box::new(TaskControlBlock {
+            header,
+            allocation: TaskAllocation::<T, F, O>::Functor(task),
+            _marker: PhantomData::<A>
+        });
+
+        TaskControlBlockVTable {
+            payload: Box::into_raw(block).cast(),
+            // read_header: |payload|
+            drop: |payload| task_control_drop::<T, A, F, O>(payload),
+            run: |payload, args| task_execute::<T, A, F, O>(payload, args),
+            move_result: |payload, slot, is_panic| {
+                task_move_result::<T, A, F, O>(payload, slot, is_panic)
+            },
+            poll: |payload, ctx| task_poll::<T, A, F, O>(payload, ctx),
+            owns: true,
+            _state: PhantomData,
+        }
+
 }
 
 impl<M> TaskControlBlockVTable<M> {
@@ -188,14 +247,24 @@ impl<M> TaskControlBlockVTable<M> {
     }
 }
 
-impl TaskControlBlockVTable<TcbInit> {
-    pub fn run(
+impl TaskControlBlockVTable<Init> {
+    pub unsafe fn run_without_args(mut self) -> Result<TaskControlBlockVTable<Pollable<'static>>, TaskControlBlockVTable<Panicked>> {
+        static NULL_PLACEHOLDER: () = ();
+        // static NULL_PLACEHOLDER: UnsafeCell<()> = const { UnsafeCell::new(()) };
+        unsafe {
+            // let null = ()
+            let mut null = ();
+            std::mem::transmute(self.run::<()>(&mut null))
+        }
+    }
+    pub unsafe fn run<'a, A>(
         mut self,
-    ) -> Result<TaskControlBlockVTable<TcbFuture>, TaskControlBlockVTable<TcbUnwind>> {
-        let reso = if (self.run)(self.payload) {
-            Ok(self.retype::<TcbFuture>())
+        args: &'a mut A
+    ) -> Result<TaskControlBlockVTable<Pollable<'a>>, TaskControlBlockVTable<Panicked>> {
+        let reso = if (self.run)(self.payload, args as *mut _ as *const ()) {
+            Ok(self.retype::<Pollable>())
         } else {
-            Err(self.retype::<TcbUnwind>())
+            Err(self.retype::<Panicked>())
         };
         self.owns = false;
         reso
@@ -215,8 +284,8 @@ impl TaskControlBlockVTable<TcbInit> {
     }
 }
 
-impl Future for TaskControlBlockVTable<TcbFuture> {
-    type Output = Result<TaskControlBlockVTable<TcbResult>, TaskControlBlockVTable<TcbUnwind>>;
+impl<'a> Future for TaskControlBlockVTable<Pollable<'a>> {
+    type Output = Result<TaskControlBlockVTable<Ready>, TaskControlBlockVTable<Panicked>>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (poll, is_healthy) = (self.poll)(self.payload, cx);
 
@@ -226,9 +295,9 @@ impl Future for TaskControlBlockVTable<TcbFuture> {
                 // self.owns = false;
 
                 let reso = if is_healthy {
-                    Ok(self.retype::<TcbResult>())
+                    Ok(self.retype::<Ready>())
                 } else {
-                    Err(self.retype::<TcbUnwind>())
+                    Err(self.retype::<Panicked>())
                 };
 
                 self.owns = false;
@@ -270,7 +339,7 @@ pub(crate) struct TaskControlBlockVTable<M> {
     payload: *const (),
     /// Executes the function, turning the internal
     /// control block state machine into a future.
-    run: fn(*const ()) -> bool,
+    run: fn(*const (), *const ()) -> bool,
     /// Polls the future produced by the function,
     /// returning the result. On [Poll::Ready] it will
     /// have automatically stored the result.
@@ -295,11 +364,11 @@ impl<M> TaskControlBlockVTable<M> {
     }
 }
 
-unsafe impl Send for TaskControlBlockVTable<TcbInit> {}
-unsafe impl Send for TaskControlBlockVTable<TcbResult> {}
-unsafe impl Send for TaskControlBlockVTable<TcbUnwind> {}
+unsafe impl Send for TaskControlBlockVTable<Init> {}
+unsafe impl Send for TaskControlBlockVTable<Ready> {}
+unsafe impl Send for TaskControlBlockVTable<Panicked> {}
 
-impl TaskControlBlockVTable<TcbResult> {
+impl TaskControlBlockVTable<Ready> {
     /// This consumes the block's V-table and
     /// moves the result out of it's slot.
     ///
@@ -319,7 +388,7 @@ impl TaskControlBlockVTable<TcbResult> {
     }
 }
 
-impl TaskControlBlockVTable<TcbUnwind> {
+impl TaskControlBlockVTable<Panicked> {
     pub fn get_panic(self) -> Box<dyn Any + Send + 'static> {
         unsafe {
             let mut slot = MaybeUninit::uninit();
@@ -354,7 +423,7 @@ mod tests {
 
         smol::future::block_on(executor.run(async move {
             let task =
-                TaskControlBlock::<_, _, usize>::create(TaskControlHeader::FireAndForget, || {
+                TaskControlBlock::<_, (), _, usize>::create(TaskControlHeader::FireAndForget, |_| {
                     // println!("Future create...");
                     async move {
                         // println!("hello");
@@ -364,7 +433,7 @@ mod tests {
 
             // println!("hi! SIZE={:?}", size_of_val(&task));
 
-            let Ok(val) = task.run().map_err(|_| ()).unwrap().await else {
+            let Ok(val) = unsafe { task.run::<()>(&mut ()) }.map_err(|_| ()).unwrap().await else {
                 panic!("Future panicked unexpectedly.");
             };
             let reso = unsafe { val.get_result::<usize>() };
@@ -379,14 +448,19 @@ mod tests {
 
         smol::future::block_on(executor.run(async move {
             let task =
-                TaskControlBlock::<_, _, usize>::create(TaskControlHeader::FireAndForget, || {
+                TaskControlBlock::<_, (), _, usize>::create(TaskControlHeader::FireAndForget, |_| {
                     panic!("I am a panic!");
-                    async move { 3 }
+                    #[allow(unreachable_code)]
+                    async {
+                        3
+                    }
                 });
+
+            let mut null = ();
 
             // println!("hi! SIZE={:?}", size_of_val(&task));
 
-            let val = task.run();
+            let val = unsafe { task.run(&mut null) };
             assert!(val.is_err());
             // let reso = unsafe { val.get_result::<usize>() };
             // println!("result: {}", reso);
@@ -400,7 +474,7 @@ mod tests {
 
         smol::future::block_on(executor.run(async move {
             let task =
-                TaskControlBlock::<_, _, usize>::create(TaskControlHeader::FireAndForget, || {
+                TaskControlBlock::<_, (), _, usize>::create(TaskControlHeader::FireAndForget, |_| {
                     // panic!("I am a panic!");
                     async move {
                         panic!("I panicked :(");
@@ -409,8 +483,11 @@ mod tests {
 
             // println!("hi! SIZE={:?}", size_of_val(&task));
 
+            let mut null = ();
+
             // let val = task.run();
-            let Ok(task) = task.run() else {
+            unsafe {
+                let Ok(task) = task.run(&mut null) else {
                 panic!("Task errored prematurely.");
             };
 
@@ -420,13 +497,14 @@ mod tests {
                     let bo = e.get_panic();
                     match bo.downcast::<&str>() {
                         Ok(st) => {
-
                             assert_eq!(*st, "I panicked :(");
                         }
-                        Err(e) => panic!("Could not downcast box.")
+                        Err(e) => panic!("Could not downcast box."),
                     }
                 }
             }
+            }
+            
 
             // let o = task.await;
 
