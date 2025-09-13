@@ -20,7 +20,7 @@ where
     V: Send + Clone + 'static
 {
     pub fn new() -> Result<Self> {
-        let (foreign, _) = spawn_actor::<Router<ShardedSlabActor<V>>>(RouterArguments {
+        let foreign = spawn_actor::<Router<ShardedSlabActor<V>>>(RouterArguments {
             arguments: 0,
             routing_policy: RoutingPolicy::RoutingFn(Box::new(|request, targets, cursor| {
 
@@ -40,10 +40,10 @@ where
             })),
             spawn_policy: RouterSpawnPolicy::PerCore,
             transformer: |_, b| b
-        })?;
+        });
 
         Ok(ShardedSlab {
-            addr: foreign
+            addr: foreign.downgrade()
         })
     }
     pub async fn get(&self, key: SlabIndex) -> Result<Option<V>> {
@@ -85,12 +85,10 @@ where
     type Arguments = usize;
     type Message = HashMapRequest<V>;
     type State = (usize, Slab<V>);
-    fn name() -> &'static str {
-        ""
-    }
-    fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
+
+    async fn pre_start(arguments: Self::Arguments) -> Self::State {
         // println!("Received init number: {arguments}");
-        Ok((arguments, Slab::new()))
+        (arguments, Slab::new())
     }
     async fn handle(
             _: crate::core::actor::base::SelfAddr<'_, Self>,

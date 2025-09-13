@@ -20,7 +20,7 @@ where
     V: Send + Clone + 'static
 {
     pub fn new() -> Result<Self> {
-        let (foreign, _) = spawn_actor::<Router<HashMapShardActor<K, V>>>(RouterArguments {
+        let foreign = spawn_actor::<Router<HashMapShardActor<K, V>>>(RouterArguments {
             arguments: (),
             routing_policy: RoutingPolicy::RoutingFn(Box::new(|message, targets, _| {
 
@@ -40,10 +40,10 @@ where
             })),
             spawn_policy: RouterSpawnPolicy::PerCore,
             transformer: |a, _| a.arguments
-        })?;
+        });
 
         Ok(ShardedHashMap {
-            addr: foreign
+            addr: foreign.downgrade()
         })
     }
     pub async fn get(&self, key: K) -> Result<Option<V>> {
@@ -80,11 +80,9 @@ where
     type Arguments = ();
     type Message = HashMapRequest<K, V>;
     type State = MonoHashMap<K, V>;
-    fn name() -> &'static str {
-        ""
-    }
-    fn pre_start(_: Self::Arguments) -> anyhow::Result<Self::State> {
-        Ok(MonoHashMap::new())
+
+    async fn pre_start(_: Self::Arguments) -> Self::State {
+        MonoHashMap::new()
     }
     async fn handle(
             _: crate::core::actor::base::SelfAddr<'_, Self>,

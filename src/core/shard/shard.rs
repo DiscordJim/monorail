@@ -1,14 +1,14 @@
-use std::{any::Any, cell::UnsafeCell, future::{poll_fn, Future}, panic::AssertUnwindSafe, pin::Pin, task::Poll};
+use std::{any::Any, cell::UnsafeCell, future::{poll_fn, Future}, panic::AssertUnwindSafe, pin::Pin, task::Poll, time::Duration};
 
 use nix::{
     sched::{sched_setaffinity, CpuSet},
     unistd::{gettid, Pid},
 };
 
-use crate::core::{actor::{base::{Actor, ActorSignal, LocalAddr}, manager::Addr}, channels::{bridge::{Bridge, Rx, Tx}, promise::{Promise, PromiseError, PromiseResolver, SyncPromiseResolver}}, shard::{
+use crate::{core::{actor::{base::{Actor, ActorSignal, LocalAddr}, manager::Addr}, alloc::MonoVec, channels::{bridge::{Bridge, Rx, Tx}, promise::{Promise, PromiseError, PromiseResolver, SyncPromiseResolver}}, shard::{
     error::ShardError,
     state::{ShardConfigMsg, ShardCtx, ShardId, ShardMapTable, ShardRoute},
-}, topology::TopologicalInformation};
+}, topology::TopologicalInformation}, monolib};
 use crate::core::
     channels::{Receiver, Sender}
 ;
@@ -30,6 +30,10 @@ where
         Ok::<_, nix::Error>(())
     });
     Ok(())
+}
+
+pub async fn sleep(duration: Duration) {
+    access_shard_ctx_ref().executor.sleep(duration).await;
 }
 
 pub(crate) fn setup_shard(
@@ -102,17 +106,17 @@ where
 
 
 
-pub fn spawn_actor<A>(args: A::Arguments) -> anyhow::Result<(Addr<A>, LocalAddr<A>)>
+pub fn spawn_actor<A>(args: A::Arguments) -> LocalAddr<A>
 where 
-    A: Actor + 'static
+    A: Actor
 {
 
     let r = access_shard_ctx_ref();
-    let address = r.actors.spawn_actor::<A>(&r.executor, args)?;
-    let local = address.clone().upgrade().map_err(|_| ()).expect("This must upgrade!");
 
-    Ok((address, local))
+    // let 
 
+    let address = r.actors.spawn_actor::<A>(&r.executor, args);
+    address.upgrade().map_err(|_| "failed to unwrap guarantee").unwrap()
 
 }
 
@@ -188,6 +192,19 @@ pub fn get_shard_route(core: ShardId) -> Option<&'static ShardRoute> {
     access_shard_ctx_ref().table.table.get(core.as_usize())
 }
 
+pub async fn call_on_all<F, FUT, O>(task: F) -> Vec<Result<O, PromiseError>>
+where 
+    F: FnOnce() -> FUT + Send + 'static + Clone,
+    FUT: Future<Output = O> + 'static,
+    O: Send + 'static
+{
+    let mut handles = FuturesUnordered::new();
+    for i in 0..monolib::get_topology_info().cores {
+        handles.push(monolib::call_on(ShardId::new(i), task.clone()));
+    }
+    handles.collect().await
+}
+
 pub async fn call_on<F, FUT, O>(core: ShardId, task: F) -> Result<O, PromiseError>
 where 
     F: FnOnce() -> FUT + Send + 'static,
@@ -206,7 +223,7 @@ where
     }
 }
 
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 
 
 #[pin_project::pin_project]
@@ -451,7 +468,7 @@ fn configure_shard(
                             } else {
                                 channels.push(ShardRoute::Bridge(Bridge::create(producers[i].take().unwrap(), consumers[i].take().unwrap())));
                             }
-                            println!("Loading {i}...");
+                            // println!("Loading {i}...");
                         }
                         
                         // for i in 0..channels.len() {

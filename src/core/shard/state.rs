@@ -12,7 +12,7 @@ use crate::core::{shard::error::ShardError};
 use crate::core::channels::Sender;
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ShardId(usize);
 

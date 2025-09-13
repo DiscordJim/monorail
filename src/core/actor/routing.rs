@@ -137,9 +137,7 @@ where
     type Arguments = RouterArguments<A>;
     type Message = A::Message;
     type State = RouterState<A>;
-    fn name() -> &'static str {
-        "Router"
-    }
+
     async fn handle(
         this: super::base::SelfAddr<'_, Self>,
         message: Self::Message,
@@ -173,13 +171,13 @@ where
 
         Ok(())
     }
-    fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
-        Ok(RouterState {
+    async fn pre_start(arguments: Self::Arguments) -> Self::State {
+        RouterState {
             arguments: arguments,
             targets: vec![],
             last_shot: 0,
             _marker: PhantomData,
-        })
+        }
     }
     async fn post_start(
         mut this: super::base::SelfAddr<'_, Self>,
@@ -217,14 +215,14 @@ mod tests {
     use futures::channel::oneshot;
     use smol::Timer;
 
-    use crate::core::{
+    use crate::{core::{
         actor::{
             base::{Actor, ActorCall},
             routing::{CallRoutePolicy, Router, RouterArguments, RouterSpawnPolicy, RoutingPolicy},
         },
         shard::{shard::{shard_id, signal_monorail, spawn_actor, spawn_async_task, submit_to}, state::ShardId},
         topology::{MonorailConfiguration, MonorailTopology},
-    };
+    }, monolib};
 
     #[test]
     pub fn test_router_d() {
@@ -241,11 +239,10 @@ mod tests {
             ) -> anyhow::Result<()> {
                 Ok(())
             }
-            fn name() -> &'static str {
-                ""
-            }
-            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
-                Ok(arguments)
+        
+            
+            async fn pre_start(arguments: Self::Arguments) -> Self::State {
+                arguments
             }
             async fn post_start(
                     this: crate::core::actor::base::SelfAddr<'_, Self>,
@@ -283,20 +280,19 @@ mod tests {
                 .with_core_override(6)
                 .build(),
             async || {
-                spawn_async_task(async move {
-                    let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
+                // spawn_async_task(async move {
+                    let address = monolib::spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
                         routing_policy: RoutingPolicy::RoundRobin,
                         transformer: |a, b| a.arguments
-                    })
-                    .unwrap();
+                    });
                 // Timer::after(Duration::from_millis(250)).await;
 
 
                     println!("hello... (R)");
 
-                    let result = forn
+                    let result = address
                         .call(5)
                         .await
                         .unwrap()
@@ -308,7 +304,7 @@ mod tests {
                     println!("Hello 2...");
 
 
-                    let result = forn
+                    let result = address
                         .call(5)
                         .await
                         .unwrap()
@@ -322,8 +318,8 @@ mod tests {
 
 
                     // println!("Result: {:?}", result);
-                })
-                .detach();
+                // })
+                // .detach();
             },
         )
         .unwrap();
@@ -345,11 +341,9 @@ mod tests {
             ) -> anyhow::Result<()> {
                 Ok(())
             }
-            fn name() -> &'static str {
-                ""
-            }
-            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
-                Ok(arguments)
+          
+            async fn pre_start(arguments: Self::Arguments) -> Self::State {
+                ()
             }
         }
 
@@ -375,20 +369,19 @@ mod tests {
                 .with_core_override(6)
                 .build(),
             async || {
-                submit_to(ShardId::new(0), || async move {
-                    let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
+                // submit_to(ShardId::new(0), || async move {
+                    let address = monolib::spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
                         routing_policy: RoutingPolicy::RoundRobin,
                         transformer: |a, _| a.arguments
-                    })
-                    .unwrap();
+                    });
                 // // Timer::after(Duration::from_millis(250)).await;
 
                     // println!("locked in");
 
 
-                    let result = forn
+                    let result = address
                         .call(5)
                         .await
                         .unwrap()
@@ -399,7 +392,7 @@ mod tests {
 
                 //     println!("Flag A");
 
-                    let result = forn
+                    let result = address
                         .call(4)
                         .await
                         .unwrap()
@@ -411,7 +404,7 @@ mod tests {
 
 
                     // println!("Result: {:?}", result);
-                });
+                // });
                 // .detach();
             },
         )
@@ -437,11 +430,9 @@ mod tests {
 
                 Ok(())
             }
-            fn name() -> &'static str {
-                ""
-            }
-            fn pre_start(arguments: Self::Arguments) -> anyhow::Result<Self::State> {
-                Ok(arguments)
+           
+            async fn pre_start(arguments: Self::Arguments) -> Self::State {
+                ()
             }
         }
 
@@ -450,22 +441,21 @@ mod tests {
                 .with_core_override(6)
                 .build(),
             async|| {
-                submit_to(ShardId::new(0), || async move {
-                    let (forn, local) = spawn_actor::<Router<BasicAdder>>(RouterArguments {
+                // submit_to(ShardId::new(0), || async move {
+                    let address = spawn_actor::<Router<BasicAdder>>(RouterArguments {
                         arguments: (),
                         spawn_policy: RouterSpawnPolicy::PerCore,
                         routing_policy: RoutingPolicy::RoutingFn(Box::new(|msg: &(usize, oneshot::Sender<(ShardId, usize)>), targets, _| {
                             msg.0
                         })),
                         transformer: |a, _| a.arguments
-                    })
-                    .unwrap();
+                    });
                     // Timer::after(Duration::from_millis(250)).await;
 
                     // println!("Flag A");
 
                     let (tx, rx) = oneshot::channel();
-                    local.send((3, tx)).await.unwrap();
+                    address.send((3, tx)).await.unwrap();
                     let (shard, result) = rx.await.unwrap();
                     assert_eq!(shard.as_usize(), 3);
                     assert_eq!(result, 4);
@@ -473,7 +463,7 @@ mod tests {
                     // println!("Flag B");
 
                     let (tx, rx) = oneshot::channel();
-                    local.send((4, tx)).await.unwrap();
+                    address.send((4, tx)).await.unwrap();
                     let (shard, result) = rx.await.unwrap();
                     assert_eq!(shard.as_usize(), 4);
                     assert_eq!(result, 5);
@@ -484,7 +474,7 @@ mod tests {
 
 
                     // println!("Result: {:?}", result);
-                });
+                // });
                 // .detach();
             },
         )

@@ -77,6 +77,7 @@ impl<T> PromiseResolver<T> {
         self.internal.is_ready.get() == PromiseState::Closed
     }
     pub fn reject_panic(self, panic_info: Box<dyn Any + Send + 'static>) {
+        println!("Reej");
         let _  = self.resolve_internal(PromiseSlot::Error(panic_info));
     }
     pub fn resolve(self, value: T) -> Result<(), (T, PromiseError)> {

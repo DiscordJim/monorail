@@ -2,15 +2,15 @@ use std::{any::Any, future::Future, panic::AssertUnwindSafe};
 
 use flume::Sender;
 
-use crate::core::{
-    channels::promise::SyncPromise,
+use crate::{core::{
+    channels::promise::{PromiseError, SyncPromise},
     shard::{
         error::ShardError,
         shard::{access_shard_ctx_ref, setup_shard, signal_monorail, ShardSeedFn, MONITOR},
         state::{ShardConfigMsg, ShardId},
     },
     task::{self, Task, TaskControlBlock, TaskControlHeader},
-};
+}, monolib};
 
 pub struct MonorailTopology {}
 
@@ -54,6 +54,14 @@ impl MonorailConfiguration {
 }
 
 impl MonorailTopology {
+    pub fn normal<T, F>(init: T) -> Result<Self, TopologyError>
+    where
+        T: FnOnce() -> F + Send + 'static,
+        F: Future<Output = ()> + 'static
+    {
+        Self::setup(MonorailConfiguration::builder().build(), init)
+
+    }
     pub fn setup<T, F>(config: MonorailConfiguration, init: T) -> Result<Self, TopologyError>
     where
         T: FnOnce() -> F + Send + 'static,
@@ -150,7 +158,22 @@ where
                 unsafe { *(&mut *f.get()) = Some(resolver); }
             });
 
-        Box::pin(seeder_function())
+        monolib::submit_to(ShardId::new(0), async move || {
+
+            match monolib::call_on(ShardId::new(0), async move || {
+                seeder_function().await
+            }).await {
+                Ok(_) => {},
+                Err(e) => match e {
+                    PromiseError::Paniced(e) => signal_monorail(Err(e)),
+                    PromiseError::PromiseClosed => {}
+                }
+            }
+            
+        });
+
+        Box::pin(async {})
+        // Box::pin(seeder_function())
     })))?;
 
     println!("Done setup.");
@@ -167,6 +190,7 @@ where
     //     }))
     //     .map_err(|_| TopologyError::SeedFailure)?;
 
+ 
     promise.wait().unwrap().unwrap();
 
     Ok(())
