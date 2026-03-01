@@ -5,3 +5,5 @@ pub mod lib;
 pub mod manager;
 pub mod mgmt;
 pub mod signals;
+pub mod builder;
+pub use builder::ActorBuilder;

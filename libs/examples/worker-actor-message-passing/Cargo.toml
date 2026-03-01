@@ -1,0 +1,13 @@
+[package]
+name = "worker-actor-message-passing"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "worker-actor-message-passing"
+path = "src/main.rs"
+
+[dependencies]
+monorail = { path = "../../monorail" }
+futures = "0.3.31"
+anyhow = "1.0.71"

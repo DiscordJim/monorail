@@ -1,0 +1,11 @@
+[package]
+name = "broadcast-to-all-shards"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "broadcast-to-all-shards"
+path = "src/main.rs"
+
+[dependencies]
+monorail = { path = "../../monorail" }

@@ -1,0 +1,11 @@
+[package]
+name = "cross-shard-computation"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cross-shard-computation"
+path = "src/main.rs"
+
+[dependencies]
+monorail = { path = "../../monorail" }

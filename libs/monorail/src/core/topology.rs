@@ -12,7 +12,7 @@ use crate::{core::{
     task::{self, Task, TaskControlBlock, TaskControlHeader},
 }, monolib};
 
-pub struct MonorailTopology {}
+pub struct MonorailTopology;
 
 #[derive(Clone)]
 pub struct TopologicalInformation {
@@ -24,7 +24,7 @@ pub struct MonorailConfigurationBuilder {
 }
 
 pub struct MonorailConfiguration {
-    limit: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 impl MonorailConfigurationBuilder {

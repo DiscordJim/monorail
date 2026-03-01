@@ -1,0 +1,11 @@
+[package]
+name = "fire-and-forget"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fire-and-forget"
+path = "src/main.rs"
+
+[dependencies]
+monorail = { path = "../../monorail" }

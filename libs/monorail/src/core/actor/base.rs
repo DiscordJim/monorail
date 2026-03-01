@@ -7,13 +7,13 @@ use smol::{future::race, Task};
 
 use crate::{core::{
     actor::{manager::{ActorIndex, Addr, AnonymousAddr, ThreadActorManager}, signals::{SignalBus, SignalPriority}}, alloc::MonoVec, channels::promise::{Promise, PromiseError}, executor::{
-        helper::{select2, Select2Result},
+        helper::{Select2Result, select2},
         scheduler::Executor,
     }, shard::{
         shard::{self, submit_to},
         state::ShardId,
     }, task::{Init, TaskControlBlock, TaskControlBlockVTable, TaskControlHeader}
-}, monolib, monovec};
+}, monolib::{self, actors}, monovec};
 
 pub trait ActorCall<M>: Actor {
     type Output;
@@ -319,10 +319,6 @@ where
     anon: AnonymousAddr
 }
 
-
-
-
-
 impl<T> LocalAddr<T>
 where
     T: Actor,
@@ -389,6 +385,11 @@ where
     pub async fn await_death(&self) -> Result<(), PromiseError> {
         self.anon.await_death().await
     }
+
+    // pub async fn register(self, name: &'static str) -> Self {
+    //     actors::register(name, self.clone()).await.expect("Failed to register the Actor");
+    //     self
+    // }
 }
 
 impl<T> LocalAddr<T>

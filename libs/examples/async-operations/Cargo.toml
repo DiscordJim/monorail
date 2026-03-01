@@ -1,0 +1,11 @@
+[package]
+name = "async-operations"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "async-operations"
+path = "src/main.rs"
+
+[dependencies]
+monorail = { path = "../../monorail" }
