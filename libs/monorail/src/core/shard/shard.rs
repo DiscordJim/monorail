@@ -33,7 +33,7 @@ where
 }
 
 pub async fn sleep(duration: Duration) {
-    access_shard_ctx_ref().executor.sleep(duration).await;
+    ShardCtx::access_ref().executor.sleep(duration).await;
 }
 
 pub(crate) fn setup_shard(
@@ -55,12 +55,12 @@ pub(crate) fn setup_shard(
 
 thread_local! {
     // static SHARD_CTX: UnsafeCell<Option<&'static ShardCtx>> = const  { UnsafeCell::new(None) };
-    static ROUTING_TABLE: UnsafeCell<Option<&'static ShardCtx>> = const { UnsafeCell::new(None) };
-    pub static MONITOR: UnsafeCell<Option<SyncPromiseResolver<Result<(), Box<dyn Any + Send + 'static>>>>> = const { UnsafeCell::new(None) };
+    pub(crate) static ROUTING_TABLE: UnsafeCell<Option<&'static ShardCtx>> = const { UnsafeCell::new(None) };
+    pub(crate) static MONITOR: UnsafeCell<Option<SyncPromiseResolver<Result<(), Box<dyn Any + Send + 'static>>>>> = const { UnsafeCell::new(None) };
 }
 
 pub fn signal_monorail(result: Result<(), Box<dyn Any + Send + 'static>>) {
-    let ctx = access_shard_ctx_ref();
+    let ctx = ShardCtx::access_ref();
     if ctx.id == ShardId::new(0) {
         println!("Hello");
         unsafe {
@@ -78,16 +78,16 @@ pub fn signal_monorail(result: Result<(), Box<dyn Any + Send + 'static>>) {
     }
 }
 
-pub(crate) fn access_shard_ctx_ref() -> &'static ShardCtx {
-    ROUTING_TABLE.with(|f| unsafe { (&*f.get()).unwrap() })
-}
+// pub(crate) fn access_shard_ctx_ref() -> &'static ShardCtx {
+//     ROUTING_TABLE.with(|f| unsafe { (&*f.get()).unwrap() })
+// }
 
 pub(crate) fn spawn_async_task<F, T>(future: F) -> smol::Task<T>
 where 
     F: Future<Output = T> + 'static,
     T: 'static
 {
-    let r = access_shard_ctx_ref();
+    let r = ShardCtx::access_ref();
     r.executor.spawn(future)
 }
 
@@ -96,7 +96,7 @@ where
 // where 
 //     F: FnOnce(&SignalHandle)
 // {
-//     let local = access_shard_ctx_ref();
+//     let local = ShardCtx::access_ref();
 //     local.executor.
 
 // }
@@ -111,7 +111,7 @@ where
     A: Actor
 {
 
-    let r = access_shard_ctx_ref();
+    let r = ShardCtx::access_ref();
 
     // let 
 
@@ -126,7 +126,7 @@ where
 //     A: Actor + 'static
 // {
 
-//     let r = access_shard_ctx_ref();
+//     let r = ShardCtx::access_ref();
 //     let address = r.actors.spawn_actor::<A>(&r.executor, args)?;
 //     let local = address.clone().upgrade().map_err(|_| ()).expect("This must upgrade!");
 
@@ -184,12 +184,12 @@ where
 // }
 
 // pub(crate) fn get_remote_brige(origin: ShardId) -> &'static Bridge {
-//     let ctx = access_shard_ctx_ref();
+//     let ctx = ShardCtx::access_ref();
 //     &ctx.table.table[origin.as_usize()]
 // }
 
 pub fn get_shard_route(core: ShardId) -> Option<&'static ShardRoute> {
-    access_shard_ctx_ref().table.table.get(core.as_usize())
+    ShardCtx::access_ref().table.table.get(core.as_usize())
 }
 
 pub async fn call_on_all<F, FUT, O>(task: F) -> Vec<Result<O, PromiseError>>
@@ -211,7 +211,7 @@ where
     FUT: Future<Output = O> + 'static,
     O: Send + 'static
 {
-    match &access_shard_ctx_ref().table.table[core.as_usize()] {
+    match &ShardCtx::access_ref().table.table[core.as_usize()] {
         ShardRoute::Bridge(bridge) => {
 
             let shot = bridge.fire_with_ticket(task).await?;
@@ -270,7 +270,7 @@ where
         Ok(fut) => {
             let (rx, tx) = Promise::<O>::new();
 
-            access_shard_ctx_ref()
+            ShardCtx::access_ref()
                 .executor
                 .spawn(LocalPromise {
                     future: fut,
@@ -296,7 +296,7 @@ where
 
 
 
-    match &access_shard_ctx_ref().table.table[core.as_usize()] {
+    match &ShardCtx::access_ref().table.table[core.as_usize()] {
         ShardRoute::Bridge(bridge) => {
 
             bridge.fire_and_forget(task);
@@ -305,7 +305,7 @@ where
         ShardRoute::Loopback => {
 //
             // let fut= task();
-            access_shard_ctx_ref()
+            ShardCtx::access_ref()
                 .executor
                 .spawn(task()).detach();
             // Err(PromiseError::PromiseClosed)
@@ -315,11 +315,11 @@ where
 }
 
 pub fn get_topology_info() -> &'static TopologicalInformation {
-    &access_shard_ctx_ref().top_info
+    &ShardCtx::access_ref().top_info
 }
 
 pub fn shard_id() -> ShardId {
-    access_shard_ctx_ref().id
+    ShardCtx::access_ref().id
 }
 
 fn perform_core_bind(

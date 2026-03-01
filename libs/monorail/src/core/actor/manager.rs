@@ -20,7 +20,7 @@ use crate::{
         actor::base::{Actor, ActorCall, ActorSignal, LocalAddr, RawHandle, SupervisorMessage},
         channels::promise::PromiseError,
         executor::scheduler::Executor,
-        shard::{shard::access_shard_ctx_ref, state::ShardId},
+        shard::state::{ShardCtx, ShardId},
     },
     monolib::{self, call_on},
 };
@@ -165,7 +165,7 @@ pub enum ActorManagementError {
 //     T: FnOnce(AddrAccess<'a, A>) -> F + Send + 'static,
 //     A: Actor
 // {
-//     let mut local = access_shard_ctx_ref().actors.borrow_mut();
+//     let mut local = ShardCtx::access_ref().actors.borrow_mut();
 //     if addr.shard == local.shard {
 //         let addr = unsafe { local.translate_without_shard_check(addr) }?;
 //         func(addr);
@@ -192,7 +192,7 @@ pub(crate) fn tam_resolve<A>(name: &'static str) -> Result<Addr<A>, ResolutionEr
 where
     A: Actor,
 {
-    let local = &access_shard_ctx_ref().actors;
+    let local = &ShardCtx::access_ref().actors;
 
     if let Some((addr, typeid)) = local.registry.borrow().forwards(&name) {
         if *typeid != TypeId::of::<A>() {
@@ -213,14 +213,14 @@ where
 //     T: FnOnce()
 
 async fn send_signal(addr: &AnonymousAddr, signal: ActorSignal) -> anyhow::Result<()> {
-    let local = &access_shard_ctx_ref().actors;
+    let local = &ShardCtx::access_ref().actors;
     if local.shard == addr.shard {
         unsafe { local.signal_actor_unchecked(addr, signal) }
     } else {
         // drop(local);
         let addr = *addr;
         Ok(monolib::call_on(addr.shard, async move || {
-            let remote = &access_shard_ctx_ref().actors;
+            let remote = &ShardCtx::access_ref().actors;
             unsafe { remote.signal_actor_unchecked(&addr, signal) }
         })
         .await
@@ -236,13 +236,13 @@ async fn await_death_on_thread(addr: &AnonymousAddr, tam: &ThreadActorManager) {
 }
 
 async fn await_death(addr: &AnonymousAddr) -> anyhow::Result<(), PromiseError> {
-    let local = &access_shard_ctx_ref().actors;
+    let local = &ShardCtx::access_ref().actors;
     if local.shard == addr.shard {
         await_death_on_thread(addr, local).await;
     } else {
         let addr = *addr;
         call_on(addr.shard, async move || {
-            await_death_on_thread(&addr, &access_shard_ctx_ref().actors).await;
+            await_death_on_thread(&addr, &ShardCtx::access_ref().actors).await;
         })
         .await?;
     }
@@ -253,7 +253,7 @@ async fn send_supervision_message(
     addr: &AnonymousAddr,
     signal: SupervisorMessage,
 ) -> anyhow::Result<()> {
-    let local = &access_shard_ctx_ref().actors;
+    let local = &ShardCtx::access_ref().actors;
     if local.shard == addr.shard {
         Ok(unsafe {
             local
@@ -264,7 +264,7 @@ async fn send_supervision_message(
         // drop(local);
         let addr = *addr;
         Ok(monolib::call_on(addr.shard, async move || {
-            let remote = &access_shard_ctx_ref().actors;
+            let remote = &ShardCtx::access_ref().actors;
             unsafe { remote.supervsn_msg_unchecked(&addr, signal) }
         })
         .await
@@ -282,7 +282,7 @@ where
     F: Future<Output = R>,
     R: Send + 'static,
 {
-    let local = &access_shard_ctx_ref().actors;
+    let local = &ShardCtx::access_ref().actors;
     if addr.anonymous.shard == local.shard {
         let actual = unsafe { local.translate_without_shard_check(addr)? };
         // drop(local);
@@ -295,7 +295,7 @@ where
         let addr = *addr;
         let e: Result<Result<R, _>, PromiseError> =
             monolib::call_on(addr.anonymous.shard, async move || {
-                let remote = &access_shard_ctx_ref().actors;
+                let remote = &ShardCtx::access_ref().actors;
                 if addr.anonymous.shard == remote.shard {
                     let actual = unsafe { remote.translate_without_shard_check(&addr)? };
                     // drop(remote);
@@ -360,7 +360,7 @@ where
         Ok(())
     }
     pub fn upgrade(self) -> Result<LocalAddr<A>, Addr<A>> {
-        match access_shard_ctx_ref()
+        match ShardCtx::access_ref()
             .actors
             // .borrow()
             .translate_local(&self)
@@ -394,7 +394,7 @@ where
 // where
 //     A: Actor
 // {
-//     let mut local = access_shard_ctx_ref().actors.borrow_mut();
+//     let mut local = ShardCtx::access_ref().actors.borrow_mut();
 //     if addr.shard == local.shard {
 //         let actual = unsafe { local.translate_without_shard_check(addr)? };
 
@@ -437,7 +437,7 @@ impl ThreadActorManager {
         for core in 0..topology.cores {
             let addr = address.clone().downgrade().downgrade();
             inflight.push(monolib::call_on(ShardId::new(core), async move || {
-                access_shard_ctx_ref()
+                ShardCtx::access_ref()
                     .actors
                     .insert_registry::<A>(name, addr);
             }));
@@ -599,10 +599,10 @@ mod tests {
     use crate::{
         core::{
             actor::base::{Actor, ActorCall},
-            executor::helper::{select2, Select2Result},
+            executor::helper::{Select2Result, select2},
             shard::{
-                shard::{access_shard_ctx_ref, signal_monorail},
-                state::ShardId,
+                shard::signal_monorail,
+                state::{ShardCtx, ShardId},
             },
             topology::{MonorailConfiguration, MonorailTopology},
         },
@@ -644,7 +644,7 @@ mod tests {
         MonorailTopology::normal(async || {
             let actor = monolib::spawn_actor::<BasicActor>(());
 
-            assert!(access_shard_ctx_ref()
+            assert!(ShardCtx::access_ref()
                 .actors
                 .is_managed(&actor.clone().downgrade().downgrade()));
 
@@ -653,7 +653,7 @@ mod tests {
             EVENT.wait().await;
 
             assert!(
-                !access_shard_ctx_ref()
+                !ShardCtx::access_ref()
                     .actors
                     .is_managed(&actor.clone().downgrade().downgrade()),
                 "The state was not actually unmanaged."
@@ -700,7 +700,7 @@ mod tests {
         MonorailTopology::normal(async || {
             let actor = monolib::spawn_actor::<BasicActor>(());
 
-            assert!(access_shard_ctx_ref()
+            assert!(ShardCtx::access_ref()
                 .actors
                 .is_managed(&actor.clone().downgrade().downgrade()));
 
@@ -720,7 +720,7 @@ mod tests {
             // EVENT.wait().await;
 
             assert!(
-                !access_shard_ctx_ref()
+                !ShardCtx::access_ref()
                     .actors
                     .is_managed(&actor.clone().downgrade().downgrade()),
                 "The state was not actually unmanaged."

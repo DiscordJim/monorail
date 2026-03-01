@@ -6,7 +6,7 @@ use crate::{core::{
     channels::promise::{PromiseError, SyncPromise},
     shard::{
         error::ShardError,
-        shard::{access_shard_ctx_ref, setup_shard, signal_monorail, ShardSeedFn, MONITOR},
+        shard::{setup_shard, signal_monorail, ShardSeedFn, MONITOR},
         state::{ShardConfigMsg, ShardId},
     },
     task::{self, Task, TaskControlBlock, TaskControlHeader},

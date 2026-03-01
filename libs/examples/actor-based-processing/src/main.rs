@@ -4,6 +4,7 @@ use monorail::core::{
     shard::state::ShardId,
 };
 use futures::channel::oneshot;
+use monorail::monolib::actors;
 use std::time::Duration;
 use monorail::core::topology::MonorailTopology;
 use monorail::core::topology::MonorailConfiguration;
@@ -178,7 +179,10 @@ async fn main() {
     // Spawn a coordinator on shard 0
     let coordinator = monolib::spawn_actor::<CoordinatorActor>(
         (0..num_cores).map(|i| ShardId::new(i)).collect()
-    ).register("coordinator").await;
+    );
+
+    actors::register("coordinator", coordinator.clone()).await.expect(&format!("Failed to register the Actor on shard {:?}", monolib::shard_id()));
+
     
     // Spawn a stats collector on shard 0
     let stats_actor = monolib::spawn_actor::<StatsActor>(());

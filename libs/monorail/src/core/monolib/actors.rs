@@ -1,4 +1,4 @@
-use crate::core::{actor::{base::{Actor, LocalAddr}, manager::{tam_resolve, Addr, ResolutionError}}, channels::promise::PromiseError, shard::shard::access_shard_ctx_ref};
+use crate::core::{actor::{base::{Actor, LocalAddr}, manager::{Addr, ResolutionError, tam_resolve}}, channels::promise::PromiseError, shard::state::ShardCtx};
 
 
 
@@ -6,7 +6,7 @@ pub async fn register<A>(name: &'static str, address: LocalAddr<A>) -> anyhow::R
 where   
     A: Actor
 {
-    access_shard_ctx_ref().actors.register(name, address).await
+    ShardCtx::access_ref().actors.register(name, address).await
 }
 
 pub fn resolve<A>(name: &'static str) -> Result<Addr<A>, ResolutionError>

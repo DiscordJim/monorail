@@ -19,8 +19,8 @@ use slab::Slab;
 use crate::core::{
     channels::promise::{Promise, PromiseError, PromiseResolver},
     shard::{
-        shard::{access_shard_ctx_ref, get_shard_route, shard_id, submit_to},
-        state::{ShardId, ShardRoute},
+        shard::{get_shard_route, shard_id, submit_to},
+        state::{ShardCtx, ShardId, ShardRoute},
     }, task::{CrossCoreTcb, Init, Ready, TaskControlBlock, TaskControlBlockVTable, TaskControlHeader},
 };
 
@@ -241,7 +241,7 @@ impl Bridge {
                     // println!("Rcv FF task");
                     // let t = r.run().await;
                     // println!("Terminated FF task");
-                    access_shard_ctx_ref().executor.spawn(r.run().map_err(|e| ()).unwrap()).detach();
+                    ShardCtx::access_ref().executor.spawn(r.run().map_err(|e| ()).unwrap()).detach();
                 }
                 TaskControlHeader::WithReturn {
                     // task,
@@ -250,7 +250,7 @@ impl Bridge {
                     origin: source,
                 } => {
                     let current = shard_id();
-                    access_shard_ctx_ref()
+                    ShardCtx::access_ref()
                         .executor
                         .spawn(async move {
                             // let task = access_shard_ctx_ref().executor.spawn(async move {

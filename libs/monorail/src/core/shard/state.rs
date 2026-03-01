@@ -6,7 +6,7 @@ use crate::core::actor::manager::ThreadActorManager;
 use crate::core::channels::bridge::{Bridge, BridgeConsumer, BridgeProducer, Rx, Tx};
 use crate::core::channels::promise::SyncPromiseResolver;
 use crate::core::executor::scheduler::Executor;
-use crate::core::shard::shard::ShardSeedFn;
+use crate::core::shard::shard::{ROUTING_TABLE, ShardSeedFn};
 use crate::core::topology::TopologicalInformation;
 use crate::core::{shard::error::ShardError};
 use crate::core::channels::Sender;
@@ -44,6 +44,10 @@ impl ShardCtx {
             actors: ThreadActorManager::new(core).into(),
             _unsend: PhantomData
         }
+    }
+
+    pub(crate) fn access_ref() -> &'static Self {
+        ROUTING_TABLE.with(|f| unsafe { (&*f.get()).unwrap() })
     }
 }
 
